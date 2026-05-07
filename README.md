@@ -33,14 +33,18 @@ Each stock gets a clear recommendation: STRONG BUY · BUY · NEUTRAL · OVERVALU
 
 **Requirements:** Python 3.8+
 
-Clone the repo and run:
+Clone the repo:
 
     git clone https://github.com/srozenblum/DividendLens.git
     cd DividendLens
 
-On Mac, double-click start.command
+**Mac**
+Double-click start.command
 
-Or manually:
+**Windows**
+Double-click start.bat
+
+Or manually on either platform:
 
     pip install -r requirements.txt
     uvicorn main:app --reload
@@ -57,4 +61,4 @@ Python · FastAPI · yfinance · HTML / CSS / JavaScript
 
 ## Disclaimer
 
-> This tool is for informational purposes only and does not constitute financial advice. Always do your own research before making investment decisions.
+This tool is for informational purposes only and does not constitute financial advice. Always do your own research before making investment decisions.
