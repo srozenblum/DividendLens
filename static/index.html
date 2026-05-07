@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dividend Lens</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+<script>if(localStorage.getItem('dlTheme')==='light')document.body.classList.add('light-theme');</script>
+
+  <!-- Persistent top navigation -->
+  <nav id="app-nav" class="app-nav">
+    <div class="app-nav-inner">
+      <a class="nav-logo" onclick="goHome()" role="button" tabindex="0" aria-label="Go home">
+        <span class="logo-icon">◎</span>
+        <span class="nav-logo-text">Dividend Lens</span>
+      </a>
+      <div class="nav-search-wrap" id="nav-search-area">
+        <div class="nav-pill-wrap">
+          <div class="search-pill nav-pill">
+            <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input type="text" id="nav-search-input" class="pill-input" placeholder="Search…" autocomplete="off" spellcheck="false">
+          </div>
+          <div id="nav-suggestions" class="suggestions hidden"></div>
+        </div>
+      </div>
+      <nav class="nav-tabs" aria-label="Main navigation">
+        <button class="nav-tab active" data-view="analyze" onclick="switchView('analyze')">🔍 Analyze</button>
+        <button class="nav-tab" data-view="watchlist" onclick="switchView('watchlist')">👁 Watchlist<span id="wl-badge" class="tab-count"></span></button>
+        <button class="nav-tab" data-view="portfolio" onclick="switchView('portfolio')">📊 Portfolio</button>
+      </nav>
+      <button id="settings-btn" class="settings-btn" onclick="toggleSettings()" title="Settings" aria-label="Open settings">🔧</button>
+    </div>
+  </nav>
+
+  <!-- Settings Panel -->
+  <div id="settings-panel" class="settings-panel hidden">
+    <div class="settings-panel-title">Settings</div>
+
+    <!-- Theme -->
+    <div class="settings-section">
+      <span class="settings-label">Theme</span>
+      <div class="toggle-group">
+        <button class="toggle-btn active" id="theme-dark-btn" onclick="setTheme('dark')">Dark</button>
+        <button class="toggle-btn" id="theme-light-btn" onclick="setTheme('light')">Light</button>
+      </div>
+    </div>
+
+    <!-- Currency -->
+    <div class="settings-section">
+      <span class="settings-label">Portfolio Currency</span>
+      <div class="toggle-group">
+        <button class="toggle-btn active" id="currency-eur-btn" onclick="setCurrency('€')">€</button>
+        <button class="toggle-btn" id="currency-usd-btn" onclick="setCurrency('$')">$</button>
+        <button class="toggle-btn" id="currency-gbp-btn" onclick="setCurrency('£')">£</button>
+      </div>
+      <p style="color:var(--text-muted);font-size:11px;margin-top:6px;font-style:italic;">Changes the currency symbol only. Values are not converted.</p>
+    </div>
+
+    <!-- Thresholds -->
+    <div class="settings-section">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <span class="settings-label" style="margin-bottom:0">Buy Thresholds</span>
+        <button onclick="resetThresholds()" class="reset-defaults-btn">↺ Reset</button>
+      </div>
+      <p class="settings-sublabel">Customize when a stock is considered a buy</p>
+
+      <div class="settings-field">
+        <div class="settings-field-label">
+          <span>Min. Dividend Yield for BUY</span>
+          <span class="settings-field-value" id="yield-display">4.0%</span>
+        </div>
+        <input type="range" class="settings-slider" id="yield-slider"
+               min="2" max="8" step="0.5" value="4"
+               oninput="onYieldSlider(this.value)">
+        <p style="font-size:11px;color:var(--text-muted);margin-top:2px">Default: 4.0%</p>
+      </div>
+
+      <div class="settings-field">
+        <div class="settings-field-label">
+          <span>Max. PER for BUY</span>
+          <span class="settings-field-value" id="per-display">15x</span>
+        </div>
+        <input type="range" class="settings-slider" id="per-slider"
+               min="8" max="25" step="1" value="15"
+               oninput="onPerSlider(this.value)">
+        <p style="font-size:11px;color:var(--text-muted);margin-top:2px">Default: 15x</p>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ===== View: Analyze ===== -->
+  <div id="view-analyze" class="view active">
+    <div id="home-state" class="home-state">
+      <div class="home-inner">
+        <div class="home-brand">
+          <span class="home-logo-icon">◎</span>
+          <h1 class="home-title">Dividend Lens</h1>
+          <p class="home-tagline">Fundamental analysis for long-term dividend investors</p>
+        </div>
+        <div class="home-search-wrap">
+          <div class="pill-wrap">
+            <div class="search-pill home-pill">
+              <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+              </svg>
+              <input type="text" id="search-input" class="pill-input" placeholder="Search by ticker or company name…" autocomplete="off" spellcheck="false">
+            </div>
+            <div id="suggestions" class="suggestions hidden"></div>
+          </div>
+          <p class="search-hint">Search by company name or ticker — e.g. Inditex, AAPL, SAN</p>
+        </div>
+      </div>
+    </div>
+    <div id="results-state" class="results-state">
+      <div class="container-results">
+        <section id="results-section">
+          <div id="results-content"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== View: Watchlist ===== -->
+  <div id="view-watchlist" class="view">
+    <div class="view-container">
+      <div class="view-header">
+        <h2 class="view-title">Watchlist</h2>
+        <div class="view-header-right">
+          <button class="wl-refresh-btn" onclick="exportWatchlistCSV()">↓ Export CSV</button>
+          <button id="wl-refresh-btn" class="wl-refresh-btn" onclick="refreshWatchlist()">↻ Refresh</button>
+          <span id="wl-timestamp-header" class="wl-timestamp"></span>
+        </div>
+      </div>
+      <div class="wl-filters">
+        <input type="text" id="wl-filter-text" class="filter-input" placeholder="Filter by name or ticker…" oninput="renderWatchlistTable()">
+        <select id="wl-filter-sector" class="filter-select" onchange="renderWatchlistTable()">
+          <option value="">All Sectors</option>
+        </select>
+        <select id="wl-filter-rec" class="filter-select" onchange="renderWatchlistTable()">
+          <option value="">All</option>
+          <option value="strong_buy">Strong Buy</option>
+          <option value="buy">Buy</option>
+          <option value="neutral">Neutral</option>
+          <option value="avoid_overvalued">Avoid</option>
+          <option value="avoid_no_dividends">No Dividends</option>
+          <option value="insufficient_data">No Data</option>
+        </select>
+      </div>
+      <div id="watchlist-table-container"></div>
+    </div>
+  </div>
+
+  <!-- ===== View: Portfolio ===== -->
+  <div id="view-portfolio" class="view">
+    <div class="view-container">
+      <div class="view-header">
+        <h2 class="view-title">Portfolio</h2>
+        <button class="btn-primary" onclick="openAddPurchaseModal()">＋ Add Purchase</button>
+      </div>
+      <div id="portfolio-summary-cards" class="summary-cards"></div>
+      <div id="portfolio-sector-chart" class="chart-card" style="display:none">
+        <div class="chart-title">Allocation by Sector</div>
+        <div id="sector-chart-container" style="width:100%;overflow:hidden">
+          <canvas id="sector-chart"></canvas>
+        </div>
+      </div>
+      <div id="portfolio-filter-bar" class="wl-filters hidden">
+        <input type="text" id="pf-filter-text" class="filter-input" placeholder="Filter by name or ticker…" oninput="onPortfolioSearch()">
+        <select id="pf-filter-sector" class="filter-select" onchange="onPortfolioSearch()">
+          <option value="">All Sectors</option>
+        </select>
+      </div>
+      <div id="portfolio-company-container"></div>
+      <div id="portfolio-dividends-container"></div>
+      <div id="portfolio-purchases-container"></div>
+    </div>
+  </div>
+
+  <!-- Mobile bottom navigation -->
+  <nav class="mobile-bottom-nav" aria-label="Main navigation">
+    <button class="mobile-tab active" data-view="analyze" onclick="switchView('analyze')">
+      <span class="mobile-tab-icon">🔍</span>
+      <span>Analyze</span>
+    </button>
+    <button class="mobile-tab" data-view="watchlist" onclick="switchView('watchlist')">
+      <span class="mobile-tab-icon">👁</span>
+      <span>Watchlist</span>
+    </button>
+    <button class="mobile-tab" data-view="portfolio" onclick="switchView('portfolio')">
+      <span class="mobile-tab-icon">📊</span>
+      <span>Portfolio</span>
+    </button>
+  </nav>
+
+  <!-- Add Purchase Modal -->
+  <div id="modal-overlay" class="modal-overlay hidden" onclick="closeAddPurchaseModal()"></div>
+  <div id="purchase-modal" class="modal hidden">
+    <div class="modal-header">
+      <h3 class="modal-title">Add Purchase</h3>
+      <button class="modal-close" onclick="closeAddPurchaseModal()">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">Company</label>
+        <div class="modal-search-wrap">
+          <div class="search-pill modal-search-pill">
+            <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input type="text" id="modal-search-input" class="pill-input" placeholder="Search company or ticker…" autocomplete="off" spellcheck="false">
+          </div>
+          <div id="modal-suggestions" class="suggestions hidden"></div>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="modal-date">Purchase Date</label>
+          <input type="date" id="modal-date" class="form-input">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="modal-amount">Amount Invested (€)</label>
+          <input type="number" id="modal-amount" class="form-input" min="1" step="0.01" placeholder="1000">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="modal-exact-shares">Exact number of shares (optional)</label>
+        <input type="number" id="modal-exact-shares" class="form-input" min="0.0001" step="0.0001" placeholder="Leave empty to calculate automatically" style="font-size:13px">
+        <p style="color:var(--text-muted);font-size:11px;margin-top:4px;font-style:italic;">If you know the exact number of shares purchased, enter it here for better accuracy.</p>
+      </div>
+      <div id="modal-error" class="modal-error hidden"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeAddPurchaseModal()">Cancel</button>
+      <button class="btn-primary" id="modal-submit-btn" onclick="submitAddPurchase()">Add Purchase</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
