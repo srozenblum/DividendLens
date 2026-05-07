@@ -3,9 +3,12 @@ __pycache__/
 *.pyo
 .env
 venv/
+venv_dividends/
 .venv/
 *.egg-info/
 dist/
 build/
 .DS_Store
 *.log
+CLAUDE.md
+.claude/
