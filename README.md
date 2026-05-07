@@ -1,6 +1,6 @@
 # 📊 Dividend Lens
 
-> A clean, local tool for analyzing stocks through a dividend value investing lens — built for long-term investors who prefer simplicity over noise.
+A clean, local tool for analyzing stocks through a dividend value investing lens — built for long-term investors who prefer simplicity over noise.
 
 ---
 
