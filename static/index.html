@@ -34,6 +34,7 @@
         <button class="nav-tab active" data-view="analyze" onclick="switchView('analyze')">🔍 Analyze</button>
         <button class="nav-tab" data-view="watchlist" onclick="switchView('watchlist')">👁 Watchlist<span id="wl-badge" class="tab-count"></span></button>
         <button class="nav-tab" data-view="portfolio" onclick="switchView('portfolio')">📊 Portfolio</button>
+        <button class="nav-tab" data-view="dividends" onclick="switchView('dividends')">💰 Dividends</button>
       </nav>
       <button id="settings-btn" class="settings-btn" onclick="toggleSettings()" title="Settings" aria-label="Open settings">🔧</button>
     </div>
@@ -93,6 +94,22 @@
         <p style="font-size:11px;color:var(--text-muted);margin-top:2px">Default: 15x</p>
       </div>
 
+
+    </div>
+
+    <!-- Withholding Tax -->
+    <div class="settings-section">
+      <span class="settings-label">Dividend Withholding Tax</span>
+      <p class="settings-sublabel">Applied to all dividend calculations</p>
+      <div class="settings-field">
+        <div class="settings-tax-input-wrap">
+          <input type="number" id="withholding-tax-input" class="settings-tax-input"
+                 min="0" max="50" step="1" value="19"
+                 oninput="onWithholdingTaxInput(this.value)">
+          <span class="settings-tax-suffix">%</span>
+        </div>
+        <p style="font-size:11px;color:var(--text-muted);margin-top:6px;font-style:italic;">Default 19% (Spain standard rate). Adjust based on your broker statements.</p>
+      </div>
     </div>
   </div>
 
@@ -179,8 +196,27 @@
         </select>
       </div>
       <div id="portfolio-company-container"></div>
-      <div id="portfolio-dividends-container"></div>
-      <div id="portfolio-purchases-container"></div>
+<div id="portfolio-purchases-container"></div>
+    </div>
+  </div>
+
+  <!-- ===== View: Dividends ===== -->
+  <div id="view-dividends" class="view">
+    <div class="view-container">
+      <div class="view-header">
+        <h2 class="view-title">Dividends</h2>
+        <select id="div-year-filter" class="filter-select" onchange="onDivYearFilter(this.value)">
+          <option value="all">All Time</option>
+        </select>
+      </div>
+      <div id="div-summary-cards" class="summary-cards div-summary-grid"></div>
+      <div id="div-annual-chart" class="chart-card" style="display:none">
+        <div class="chart-title">Net Dividends Received per Year</div>
+        <div style="height:180px;position:relative">
+          <canvas id="div-annual-canvas"></canvas>
+        </div>
+      </div>
+      <div id="div-payments-container"></div>
     </div>
   </div>
 
@@ -197,6 +233,10 @@
     <button class="mobile-tab" data-view="portfolio" onclick="switchView('portfolio')">
       <span class="mobile-tab-icon">📊</span>
       <span>Portfolio</span>
+    </button>
+    <button class="mobile-tab" data-view="dividends" onclick="switchView('dividends')">
+      <span class="mobile-tab-icon">💰</span>
+      <span>Dividends</span>
     </button>
   </nav>
 

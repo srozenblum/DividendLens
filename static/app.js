@@ -151,12 +151,26 @@ function getCurrencySymbol() {
   return localStorage.getItem('dlCurrency') || '€';
 }
 
+function getWithholdingTax() {
+  return parseFloat(localStorage.getItem('dlWithholdingTax') || '19');
+}
+
+function onWithholdingTaxInput(val) {
+  const v = Math.max(0, Math.min(50, parseInt(val, 10) || 0));
+  localStorage.setItem('dlWithholdingTax', String(v));
+  _renderDividendsFromCache();
+  if (currentView === 'dividends') _renderDividendsTabContent();
+}
+
 function initSettings() {
   const theme = localStorage.getItem('dlTheme') || 'dark';
   applyTheme(theme, false);
 
   const currency = getCurrencySymbol();
   updateCurrencyBtns(currency);
+
+  const taxInput = document.getElementById('withholding-tax-input');
+  if (taxInput) taxInput.value = getWithholdingTax();
 
   const minYield = getMinYield();
   const maxPer = getMaxPer();
@@ -206,6 +220,7 @@ function setCurrency(sym) {
   localStorage.setItem('dlCurrency', sym);
   updateCurrencyBtns(sym);
   if (currentView === 'portfolio') renderPortfolio();
+  if (currentView === 'dividends') _renderDividendsTabContent();
 }
 
 function onYieldSlider(val) {
@@ -253,6 +268,7 @@ function switchView(view) {
     renderWlTimestamp();
   }
   if (view === 'portfolio') renderPortfolio();
+  if (view === 'dividends') renderDividendsView();
 }
 
 function updateNavSearch() {
@@ -1097,7 +1113,11 @@ const formatDate = (dateStr) => {
 let purchaseDateSortDir = -1; // -1 desc, 1 asc
 let portfolioSearchQuery = '';
 let portfolioSectorFilter = '';
-let _dividendsCache = null;
+let _dividendsCache    = null;
+let _dividendsTabCache = null;
+let divTabYearFilter   = 'all';
+let divTabDateSortDir  = -1;
+let divTabChartInst    = null;
 
 function populatePfSectorFilter() {
   const select = document.getElementById('pf-filter-sector');
@@ -1120,64 +1140,16 @@ function onPortfolioSearch() {
 
 function _renderDividendsFromCache() {
   if (!_dividendsCache) return;
-  const { companyList, results } = _dividendsCache;
-  const container = document.getElementById('portfolio-dividends-container');
-  if (!container) return;
+  const { results } = _dividendsCache;
 
   const sym    = getCurrencySymbol();
+  const tax    = getWithholdingTax();
   const fmtAmt = v => sym + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-  let rows = companyList
-    .map(co => ({ ...co, divData: results[co.symbol] || { dividends: [], totalReceived: 0 } }))
-    .sort((a, b) => (b.divData.totalReceived || 0) - (a.divData.totalReceived || 0));
-
-  if (portfolioSearchQuery) {
-    rows = rows.filter(r =>
-      r.symbol.toLowerCase().includes(portfolioSearchQuery) ||
-      (r.companyName || '').toLowerCase().includes(portfolioSearchQuery)
-    );
-  }
-  if (portfolioSectorFilter) {
-    rows = rows.filter(r => r.sector === portfolioSectorFilter);
-  }
-
-  const hasAny = rows.some(r => r.divData.totalReceived > 0);
-
-  let bodyHTML;
-  if (!rows.length && (portfolioSearchQuery || portfolioSectorFilter)) {
-    bodyHTML = `<p class="empty-state-view">No results for this filter.</p>`;
-  } else if (!hasAny) {
-    bodyHTML = `<p class="empty-state-view">No dividends received yet. Dividends will appear here as they are paid.</p>`;
-  } else {
-    const tableRows = rows.map(r => {
-      const d        = r.divData;
-      const totalRec = d.totalReceived > 0 ? fmtAmt(d.totalReceived) : '—';
-      const divs     = d.dividends || [];
-      const lastDate = divs.length > 0 ? formatDate(divs[divs.length - 1].date) : '—';
-      const count    = divs.length > 0 ? String(divs.length) : '—';
-      return (
-        `<tr>` +
-        `<td class="td-ticker-portfolio" onclick="analyzeStock('${esc(r.symbol)}')"><span class="wl-ticker">${esc(r.symbol)}<span class="ticker-goto-icon">↗</span></span></td>` +
-        `<td class="td-company">${esc(r.companyName)}</td>` +
-        `<td>${r.totalShares.toFixed(2)}</td>` +
-        `<td>${totalRec}</td>` +
-        `<td>${lastDate}</td>` +
-        `<td>${count}</td>` +
-        `</tr>`
-      );
-    }).join('');
-
-    bodyHTML =
-      `<div class="table-wrap"><table class="data-table">` +
-      `<thead><tr>` +
-      `<th>Ticker</th><th>Company</th><th>Shares</th>` +
-      `<th>Total Received (${sym})</th><th>Last Payment</th><th>Payments Count</th>` +
-      `</tr></thead>` +
-      `<tbody>${tableRows}</tbody>` +
-      `</table></div>`;
-  }
-
-  container.innerHTML = _dividendsSectionShell() + bodyHTML;
+  const grandGross = Object.values(results).reduce((s, d) => s + (d.totalReceived || 0), 0);
+  const grandNet   = grandGross * (1 - tax / 100);
+  const cardEl = document.getElementById('dividend-total-card');
+  if (cardEl) cardEl.textContent = fmtAmt(grandNet);
 }
 
 function renderPortfolio() {
@@ -1356,6 +1328,7 @@ function togglePurchaseDateSort() {
 function deletePurchase(id) {
   if (!confirm('Delete this purchase?')) return;
   savePortfolio(getPortfolio().filter(p => p.id !== id));
+  _dividendsTabCache = null;
   renderPortfolio();
 }
 
@@ -1460,7 +1433,7 @@ async function renderPortfolioDividendsReceived(portfolio) {
 
   _dividendsCache = null;
 
-  if (!portfolio.length) { container.innerHTML = ''; return; }
+  if (!portfolio.length) return;
 
   // Build per-company data: earliest purchase date and total shares
   const companyMap = {};
@@ -1472,9 +1445,6 @@ async function renderPortfolioDividendsReceived(portfolio) {
     if (p.date < companyMap[p.symbol].earliestDate) companyMap[p.symbol].earliestDate = p.date;
   }
   const companyList = Object.values(companyMap);
-
-  // Show loading skeleton
-  container.innerHTML = _dividendsSectionShell() + _dividendsSkeleton(companyList.length);
 
   // Fetch dividends for all companies in parallel (max 5 concurrent)
   const results = {};
@@ -1489,15 +1459,274 @@ async function renderPortfolioDividendsReceived(portfolio) {
     }
   });
 
-  // Update the 5th summary card (unfiltered grand total)
-  const sym    = getCurrencySymbol();
-  const fmtAmt = v => sym + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const grandTotal = Object.values(results).reduce((s, d) => s + (d.totalReceived || 0), 0);
-  const cardEl = document.getElementById('dividend-total-card');
-  if (cardEl) cardEl.textContent = fmtAmt(grandTotal);
-
   _dividendsCache = { companyList, results };
   _renderDividendsFromCache();
+}
+
+
+// ===== Dividends Tab =====
+
+async function renderDividendsView() {
+  const portfolio = getPortfolio();
+
+  if (!portfolio.length) {
+    document.getElementById('div-summary-cards').innerHTML = '';
+    const chartEl = document.getElementById('div-annual-chart');
+    if (chartEl) chartEl.style.display = 'none';
+    document.getElementById('div-payments-container').innerHTML =
+      '<p class="empty-state-view">No dividend payments recorded yet. Add purchases to your portfolio to start tracking dividends.</p>';
+    return;
+  }
+
+  if (_dividendsTabCache) {
+    _renderDividendsTabContent();
+    return;
+  }
+
+  const container = document.getElementById('div-payments-container');
+  if (container) {
+    container.innerHTML = '<div class="loading"><div class="spinner"></div><div>Loading dividend data…</div></div>';
+  }
+
+  const companyMap = {};
+  for (const p of portfolio) {
+    if (!companyMap[p.symbol]) {
+      companyMap[p.symbol] = { symbol: p.symbol, companyName: p.companyName, totalShares: 0, earliestDate: p.date };
+    }
+    companyMap[p.symbol].totalShares += p.shares;
+    if (p.date < companyMap[p.symbol].earliestDate) companyMap[p.symbol].earliestDate = p.date;
+  }
+  const companyList = Object.values(companyMap);
+
+  const results = {};
+  await asyncPool(5, companyList, async (co) => {
+    try {
+      const params = new URLSearchParams({ symbol: co.symbol, from_date: co.earliestDate, shares: String(co.totalShares) });
+      const res = await fetch(`/api/dividends-received?${params}`);
+      if (!res.ok) throw new Error();
+      results[co.symbol] = await res.json();
+    } catch (_) {
+      results[co.symbol] = { dividends: [], totalReceived: 0 };
+    }
+  });
+
+  _dividendsTabCache = { companyList, results };
+  _renderDividendsTabContent();
+}
+
+function onDivYearFilter(val) {
+  divTabYearFilter = val;
+  _renderDividendsTabContent();
+}
+
+function toggleDivTabDateSort() {
+  divTabDateSortDir *= -1;
+  _renderDividendsTabContent();
+}
+
+function _renderDividendsTabContent() {
+  if (!_dividendsTabCache) return;
+  const { companyList, results } = _dividendsTabCache;
+
+  const tax    = getWithholdingTax();
+  const sym    = getCurrencySymbol();
+  const fmtAmt = v => sym + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  // Flatten all payments across companies
+  const allPayments = [];
+  for (const co of companyList) {
+    const data = results[co.symbol] || { dividends: [] };
+    for (const pmt of (data.dividends || [])) {
+      allPayments.push({
+        date:        pmt.date,
+        symbol:      co.symbol,
+        companyName: co.companyName,
+        gross:       pmt.totalAmount,
+        net:         pmt.totalAmount * (1 - tax / 100),
+      });
+    }
+  }
+
+  // Available years (descending)
+  const years = [...new Set(allPayments.map(p => p.date.slice(0, 4)))].sort((a, b) => b - a);
+
+  // Populate year filter
+  const select = document.getElementById('div-year-filter');
+  if (select) {
+    const current = divTabYearFilter;
+    select.innerHTML = '<option value="all">All Time</option>' +
+      years.map(y => `<option value="${y}"${y === current ? ' selected' : ''}>${y}</option>`).join('');
+    if (current !== 'all' && !years.includes(current)) {
+      divTabYearFilter = 'all';
+      select.value = divTabYearFilter;
+    }
+  }
+
+  // Filter payments for selected period
+  const filtered = divTabYearFilter === 'all'
+    ? allPayments
+    : allPayments.filter(p => p.date.startsWith(divTabYearFilter));
+
+  _renderDivSummaryCards(filtered, sym, fmtAmt);
+  _renderDivAnnualChart(allPayments, sym, tax);
+  _renderDivPaymentsTable(filtered, allPayments, sym, fmtAmt, tax);
+}
+
+function _renderDivSummaryCards(filtered, sym, fmtAmt) {
+  const container = document.getElementById('div-summary-cards');
+  if (!container) return;
+
+  const totalGross = filtered.reduce((s, p) => s + p.gross, 0);
+  const totalNet   = filtered.reduce((s, p) => s + p.net,   0);
+  const taxPaid    = totalGross - totalNet;
+  const count      = filtered.length;
+
+  const cards = [
+    { label: 'Total Received (net)', value: fmtAmt(totalNet),   accent: true  },
+    { label: 'Total Gross',          value: fmtAmt(totalGross), accent: false },
+    { label: 'Tax Paid',             value: fmtAmt(taxPaid),    accent: false },
+    { label: 'Payments',             value: String(count),       accent: false },
+  ];
+
+  container.innerHTML = cards.map(c =>
+    `<div class="summary-card${c.accent ? ' summary-card-accent' : ''}">` +
+    `<div class="summary-card-label">${esc(c.label)}</div>` +
+    `<div class="summary-card-value">${esc(c.value)}</div>` +
+    `</div>`
+  ).join('');
+}
+
+function _renderDivAnnualChart(allPayments, sym, tax) {
+  const chartCard = document.getElementById('div-annual-chart');
+  if (!chartCard) return;
+
+  if (!allPayments.length) { chartCard.style.display = 'none'; return; }
+  chartCard.style.display = 'block';
+
+  const yearTotals = {};
+  for (const p of allPayments) {
+    const year = p.date.slice(0, 4);
+    yearTotals[year] = (yearTotals[year] || 0) + p.net;
+  }
+  const years  = Object.keys(yearTotals).sort();
+  const values = years.map(y => yearTotals[y]);
+
+  const canvas = document.getElementById('div-annual-canvas');
+  if (!canvas) return;
+
+  if (divTabChartInst) { divTabChartInst.destroy(); divTabChartInst = null; }
+
+  const isLight    = document.body.classList.contains('light-theme');
+  const labelColor = isLight ? '#374151' : '#9ca3af';
+  const gridColor  = isLight ? '#e2e8f0' : '#1f2937';
+
+  const barLabelPlugin = {
+    id: 'divBarLabels',
+    afterDatasetsDraw(chart) {
+      const { ctx } = chart;
+      const meta = chart.getDatasetMeta(0);
+      ctx.save();
+      ctx.font = '600 11px Inter, system-ui, sans-serif';
+      ctx.fillStyle = labelColor;
+      ctx.textAlign = 'center';
+      meta.data.forEach((bar, i) => {
+        const val = chart.data.datasets[0].data[i];
+        ctx.fillText(
+          sym + val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+          bar.x, bar.y - 6
+        );
+      });
+      ctx.restore();
+    },
+  };
+
+  divTabChartInst = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels:   years,
+      datasets: [{ data: values, backgroundColor: '#22c55e', borderRadius: 4 }],
+    },
+    options: {
+      responsive:          true,
+      maintainAspectRatio: false,
+      layout: { padding: { top: 28 } },
+      plugins: {
+        legend:  { display: false },
+        tooltip: { callbacks: { label: ctx => ' ' + sym + ctx.parsed.y.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) } },
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: labelColor, font: { size: 12 } } },
+        y: { grid: { color: gridColor }, ticks: { color: labelColor, callback: v => sym + v.toFixed(0) } },
+      },
+    },
+    plugins: [barLabelPlugin],
+  });
+}
+
+function _renderDivPaymentsTable(filtered, allPayments, sym, fmtAmt, tax) {
+  const container = document.getElementById('div-payments-container');
+  if (!container) return;
+
+  if (!allPayments.length) {
+    container.innerHTML =
+      '<p class="empty-state-view">No dividend payments recorded yet. Add purchases to your portfolio to start tracking dividends.</p>';
+    return;
+  }
+
+  const sorted = [...filtered].sort((a, b) =>
+    divTabDateSortDir * (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)
+  );
+
+  const sortIcon = divTabDateSortDir === -1 ? '↓' : '↑';
+
+  const headerHTML =
+    `<div class="section-title-row"><h3 class="section-title">Payments</h3></div>`;
+
+  if (!sorted.length) {
+    container.innerHTML = headerHTML +
+      '<p class="empty-state-view">No payments in the selected period.</p>';
+    return;
+  }
+
+  let rowsHTML = '';
+  if (divTabYearFilter === 'all') {
+    let currentYear = null;
+    for (const pmt of sorted) {
+      const year = pmt.date.slice(0, 4);
+      if (year !== currentYear) {
+        currentYear = year;
+        rowsHTML += `<tr class="div-year-separator-row"><td colspan="6">${esc(year)}</td></tr>`;
+      }
+      rowsHTML += _divPaymentRowHTML(pmt, fmtAmt, tax);
+    }
+  } else {
+    rowsHTML = sorted.map(pmt => _divPaymentRowHTML(pmt, fmtAmt, tax)).join('');
+  }
+
+  container.innerHTML =
+    headerHTML +
+    `<div class="table-wrap"><table class="data-table">` +
+    `<thead><tr>` +
+    `<th class="sortable" onclick="toggleDivTabDateSort()">Date <span class="sort-indicator active">${sortIcon}</span></th>` +
+    `<th>Ticker</th><th>Company</th>` +
+    `<th>Amount (gross)</th><th>Tax</th><th>Amount (net)</th>` +
+    `</tr></thead>` +
+    `<tbody>${rowsHTML}</tbody>` +
+    `</table></div>`;
+}
+
+function _divPaymentRowHTML(pmt, fmtAmt, tax) {
+  return (
+    `<tr>` +
+    `<td>${esc(formatDate(pmt.date))}</td>` +
+    `<td class="td-ticker-portfolio" onclick="analyzeStock('${esc(pmt.symbol)}')">` +
+    `<span class="wl-ticker">${esc(pmt.symbol)}<span class="ticker-goto-icon">↗</span></span></td>` +
+    `<td class="td-company">${esc(pmt.companyName)}</td>` +
+    `<td>${fmtAmt(pmt.gross)}</td>` +
+    `<td>${tax}%</td>` +
+    `<td>${fmtAmt(pmt.net)}</td>` +
+    `</tr>`
+  );
 }
 
 
@@ -1610,6 +1839,7 @@ async function submitAddPurchase() {
     portfolio.push(purchase);
     savePortfolio(portfolio);
 
+    _dividendsTabCache = null;
     closeAddPurchaseModal();
     if (currentView === 'portfolio') renderPortfolio();
   } catch (e) {
