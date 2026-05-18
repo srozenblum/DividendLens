@@ -21,8 +21,9 @@ Each stock gets a clear recommendation: STRONG BUY · BUY · NEUTRAL · OVERVALU
 ## Features
 
 - 🔍 **Analyze** any stock by name or ticker
-- ⭐ **Watchlist** with sector grouping, filters, notes and auto-refresh
-- 📈 **Portfolio tracker** with purchase history, average price and dividends received
+- ⭐ **Watchlist** with sector grouping, filters, sorting, notes and parallel auto-refresh
+- 📊 **Portfolio tracker** with purchase history, weighted average price and sector allocation
+- 💰 **Dividends tracker** with per-payment breakdown, tax calculation and annual chart
 - 🌗 **Dark / light theme** and customizable buy thresholds
 - 💾 **CSV export** for watchlist and portfolio data
 - 📡 Data powered by Yahoo Finance via yfinance — no API key needed
