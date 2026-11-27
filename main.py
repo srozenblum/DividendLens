@@ -3,6 +3,7 @@ from fastapi.staticfiles import StaticFiles
 import yfinance as yf
 import math
 import datetime
+import json
 import re
 
 app = FastAPI()
@@ -494,31 +495,119 @@ async def historical_yield_endpoint(symbol: str):
         return {"symbol": symbol.upper(), "avgYield3y": None, "currentYield": None, "context": "unavailable"}
 
 
+# Share-count dust below this is treated as zero (float noise, not a real lot).
+_SHARE_EPS = 1e-6
+
+
+def normalize_transactions(transactions) -> list:
+    """Return (YYYY-MM-DD, signed shares) pairs. Buys are positive, sells negative.
+
+    A missing side/type is a buy, so portfolio records saved before sales
+    existed still work. Non-positive share counts are ignored.
+    """
+    normalized = []
+    if not transactions:
+        return normalized
+    for item in transactions:
+        if not isinstance(item, dict):
+            continue
+        date_str = str(item.get("date") or "").strip()[:10]
+        try:
+            datetime.datetime.strptime(date_str, "%Y-%m-%d")
+            shares = float(item.get("shares") or 0)
+        except (TypeError, ValueError):
+            continue
+        if shares <= 0:
+            continue
+        side = str(item.get("side") or item.get("type") or "buy").lower()
+        signed = -shares if side in ("sell", "sale") else shares
+        normalized.append((date_str, signed))
+    return normalized
+
+
+def _ex_dividend_date(ts):
+    """Calendar date of a yfinance dividend timestamp.
+
+    Ticker.dividends is indexed by the ex-dividend date (market open in the
+    exchange timezone, e.g. 09:30 America/New_York). Use that wall-clock date,
+    not a UTC conversion.
+    """
+    if isinstance(ts, datetime.datetime):
+        return ts.date()
+    if isinstance(ts, datetime.date):
+        return ts
+    if hasattr(ts, "date"):
+        return ts.date()
+    return datetime.datetime.strptime(str(ts)[:10], "%Y-%m-%d").date()
+
+
+def shares_held_before_ex_date(transactions, ex_date) -> float:
+    """Shares eligible for the dividend whose ex-dividend date is ex_date.
+
+    You receive a dividend only if you held the shares before the ex-dividend
+    date. A purchase on the ex-date does not qualify. A sale on the ex-date
+    still does, because those shares were held at the start of that day.
+    """
+    ex_str = _ex_dividend_date(ex_date).isoformat()
+    total = 0.0
+    for date_str, signed in transactions:
+        if date_str < ex_str:
+            total += signed
+    return total if total > _SHARE_EPS else 0.0
+
+
+def calculate_dividends_received(divs, transactions) -> list:
+    """Per-payment amounts using shares held before each ex-dividend date."""
+    if divs is None or len(divs) == 0:
+        return []
+    items = divs.items() if hasattr(divs, "items") else divs
+    result = []
+    for ts, amount_per_share in items:
+        held = shares_held_before_ex_date(transactions, ts)
+        if held <= _SHARE_EPS:
+            continue
+        per_share = float(amount_per_share)
+        ex_date = _ex_dividend_date(ts)
+        result.append({
+            "date": ex_date.strftime("%Y-%m-%d"),
+            "amountPerShare": round(per_share, 4),
+            "shares": round(held, 4),
+            "totalAmount": round(per_share * held, 2),
+        })
+    return result
+
+
 @app.get("/api/dividends-received")
-async def dividends_received_endpoint(symbol: str, from_date: str, shares: float):
+async def dividends_received_endpoint(
+    symbol: str,
+    transactions: str = "",
+    from_date: str = "",
+    shares: float = 0,
+):
+    """Dividends actually received for one symbol.
+
+    `transactions` is a JSON list of {date, shares, side} with side "buy" or
+    "sell". Dates are ex-dividend dates from yfinance. The legacy
+    `from_date` + `shares` query (a single buy) is still accepted.
+    """
     try:
+        parsed = []
+        if transactions:
+            loaded = json.loads(transactions)
+            if isinstance(loaded, list):
+                parsed = loaded
+        elif from_date and shares > 0:
+            parsed = [{"date": from_date, "shares": shares, "side": "buy"}]
+
+        normalized = normalize_transactions(parsed)
+        if not normalized:
+            return {"symbol": symbol.upper(), "dividends": [], "totalReceived": 0.0, "currency": "USD"}
+
         stock = yf.Ticker(symbol)
-        info = stock.info
-        currency = info.get("currency", "USD")
-
-        divs = stock.dividends
-        if divs is None or len(divs) == 0:
-            return {"symbol": symbol.upper(), "dividends": [], "totalReceived": 0.0, "currency": currency}
-
-        from_date_obj = datetime.datetime.strptime(from_date, "%Y-%m-%d").date()
-
-        result_divs = []
-        for ts, amount_per_share in divs.items():
-            if ts.date() >= from_date_obj:
-                total = float(amount_per_share) * shares
-                result_divs.append({
-                    "date": ts.strftime("%Y-%m-%d"),
-                    "amountPerShare": round(float(amount_per_share), 4),
-                    "totalAmount": round(total, 2),
-                })
-
+        info = stock.info or {}
+        currency = info.get("currency", "USD") if isinstance(info, dict) else "USD"
+        result_divs = calculate_dividends_received(stock.dividends, normalized)
         total_received = round(sum(d["totalAmount"] for d in result_divs), 2)
-
         return {
             "symbol": symbol.upper(),
             "dividends": result_divs,

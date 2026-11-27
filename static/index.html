@@ -283,6 +283,34 @@
     </div>
   </div>
 
+  <!-- Sell Shares Modal -->
+  <div id="sell-overlay" class="modal-overlay hidden" onclick="closeSellModal()"></div>
+  <div id="sell-modal" class="modal hidden">
+    <div class="modal-header">
+      <h3 class="modal-title">Sell Shares</h3>
+      <button class="modal-close" onclick="closeSellModal()">×</button>
+    </div>
+    <div class="modal-body">
+      <p id="sell-company-label" class="sell-company-label"></p>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="sell-date">Sale Date</label>
+          <input type="date" id="sell-date" class="form-input">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="sell-shares">Shares to Sell</label>
+          <input type="number" id="sell-shares" class="form-input" min="0.0001" step="any">
+        </div>
+      </div>
+      <p id="sell-hint" class="sell-hint"></p>
+      <div id="sell-error" class="modal-error hidden"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeSellModal()">Cancel</button>
+      <button class="btn-primary" id="sell-submit-btn" onclick="submitSell()">Sell</button>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>
