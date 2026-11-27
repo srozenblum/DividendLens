@@ -10,6 +10,8 @@ let currentSector        = null;
 let currentRec           = null;
 let currentIndustry      = null;
 let currentDivYield      = null;
+let currentTrailingDivYield = null;
+let currentYieldComparison = null;
 let currentPer           = null;
 let currentDividendTrend = null;
 let currentView          = 'analyze';
@@ -23,6 +25,9 @@ const METRICS = [
   { key: 'debtToEbitda',  label: 'Debt / EBITDA', scoreKey: 'debtScore',   fmt: v => v.toFixed(2) + 'x', tooltip: 'Measures how many years of operating profit it would take to pay off all debt. Below 3 is healthy. Above 4 starts to be a concern. Very stable companies like utilities can handle higher levels.' },
   { key: 'payoutRatio',   label: 'Payout Ratio',  scoreKey: 'payoutScore', fmt: v => v.toFixed(1) + '%', tooltip: 'The percentage of earnings paid out as dividends. Between 40–60% is ideal — enough reward for shareholders while keeping money to grow. Above 80% may be unsustainable long-term.' },
 ];
+
+const YIELD_FORWARD_TOOLTIP = 'The latest dividend, annualised, divided by the current price. It shows what the company would pay you if it keeps the current dividend.';
+const YIELD_TRAILING_TOOLTIP = 'The sum of dividends paid over the last 12 months, divided by the current price. This is the figure brokers such as Revolut usually show.';
 
 const SCORE_CFG = {
   perScore: {
@@ -360,7 +365,7 @@ function isInWatchlist(symbol) {
   return getWatchlist().some(i => i.symbol === symbol);
 }
 
-function addToWatchlist(symbol, name, sector, industry, recommendation, divYield, per, dividendTrend) {
+function addToWatchlist(symbol, name, sector, industry, recommendation, divYield, per, dividendTrend, trailingDivYield, yieldComparison) {
   const wl  = getWatchlist();
   const idx = wl.findIndex(i => i.symbol === symbol);
   const entry = {
@@ -370,6 +375,8 @@ function addToWatchlist(symbol, name, sector, industry, recommendation, divYield
     industry: industry || '',
     recommendation: recommendation || '',
     divYield: divYield ?? null,
+    trailingDivYield: trailingDivYield ?? null,
+    yieldComparison: yieldComparison || null,
     per: per ?? null,
     dividendTrend: dividendTrend ?? null,
     notes: idx !== -1 ? (wl[idx].notes || '') : '',
@@ -397,6 +404,7 @@ function toggleWatchlist() {
         currentTicker, currentName || currentTicker,
         currentSector, currentIndustry, currentRec,
         currentDivYield, currentPer, currentDividendTrend,
+        currentTrailingDivYield, currentYieldComparison,
       );
 }
 
@@ -460,6 +468,7 @@ function renderWatchlistTable() {
       if (wlSort.col === 'rec')    { av = RECOMMENDATION_ORDER[a.recommendation] ?? 99; bv = RECOMMENDATION_ORDER[b.recommendation] ?? 99; }
       if (wlSort.col === 'sector') { av = mapSector(a.sector, a.industry || '', a.symbol); bv = mapSector(b.sector, b.industry || '', b.symbol); }
       if (wlSort.col === 'yield')  { av = a.divYield ?? -1; bv = b.divYield ?? -1; }
+      if (wlSort.col === 'trailingYield') { av = a.trailingDivYield ?? -1; bv = b.trailingDivYield ?? -1; }
       if (wlSort.col === 'per')    { av = a.per ?? 99999;   bv = b.per ?? 99999;   }
       if (av < bv) return -wlSort.dir;
       if (av > bv) return  wlSort.dir;
@@ -487,7 +496,8 @@ function renderWatchlistTable() {
       `<td class="td-company">${esc(item.name || '')}</td>` +
       `<td>${esc(sector)}</td>` +
       `<td>${rb ? `<span class="rec-pill ${rb.cls}">${rb.label}</span>` : '—'}</td>` +
-      `<td>${item.divYield != null ? item.divYield.toFixed(2) + '%' : '—'}</td>` +
+      `<td>${formatYieldPct(item.divYield)}</td>` +
+      `<td>${formatYieldPct(item.trailingDivYield)}${yieldGapHTML(item.yieldComparison)}</td>` +
       `<td>${item.per != null ? item.per.toFixed(1) + 'x' : '—'}</td>` +
       `<td>${wt ? `<span class="wl-trend-plain" style="color:${wt.color}">${wt.icon} ${wt.label}</span>` : '—'}</td>` +
       `<td data-note-sym="${esc(item.symbol)}">${notePreviewHTML(item.notes || '', item.symbol)}</td>` +
@@ -506,7 +516,8 @@ function renderWatchlistTable() {
     `<th>Company</th>` +
     `<th class="sortable" onclick="setWlSort('sector')">Sector ${si('sector')}</th>` +
     `<th class="sortable" onclick="setWlSort('rec')" style="min-width:140px">Recommendation ${si('rec')}</th>` +
-    `<th class="sortable" onclick="setWlSort('yield')">Div. Yield ${si('yield')}</th>` +
+    `<th class="sortable" onclick="setWlSort('yield')">Forward Yield ${yieldTipIcon(YIELD_FORWARD_TOOLTIP)} ${si('yield')}</th>` +
+    `<th class="sortable" onclick="setWlSort('trailingYield')">Trailing 12M Yield ${yieldTipIcon(YIELD_TRAILING_TOOLTIP)} ${si('trailingYield')}</th>` +
     `<th class="sortable" onclick="setWlSort('per')">PER ${si('per')}</th>` +
     `<th style="min-width:100px">Dividend Trend</th>` +
     `<th style="min-width:160px">Notes</th>` +
@@ -518,6 +529,7 @@ function renderWatchlistTable() {
   container.querySelectorAll('td[data-note-sym]').forEach(td => {
     td.addEventListener('click', e => e.stopPropagation());
   });
+  attachTooltipListeners();
 }
 
 function setWlSort(col) {
@@ -660,6 +672,8 @@ async function refreshWatchlist() {
           ...watchlist[index],
           recommendation: data.scores.overallRecommendation,
           divYield:       data.metrics.dividendYield,
+          trailingDivYield: data.metrics.trailingDividendYield ?? null,
+          yieldComparison: data.metrics.yieldComparison || null,
           per:            data.metrics.per,
           dividendTrend:  data.dividendTrend,
           sector:         data.sector   || watchlist[index].sector,
@@ -813,6 +827,8 @@ async function analyzeStock(ticker) {
     currentIndustry      = data.industry;
     currentRec           = data.scores.overallRecommendation;
     currentDivYield      = data.metrics.dividendYield;
+    currentTrailingDivYield = data.metrics.trailingDividendYield ?? null;
+    currentYieldComparison = data.metrics.yieldComparison || null;
     currentPer           = data.metrics.per;
     currentDividendTrend = data.dividendTrend;
     renderResults(data);
@@ -869,6 +885,47 @@ function buildRecSummary(scores) {
   return parts.join('  ·  ') || '—';
 }
 
+function formatYieldPct(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—';
+  return Number(value).toFixed(2) + '%';
+}
+
+function yieldTipIcon(text) {
+  return `<span class="info-icon info-icon-inline" data-tooltip="${esc(text)}" onclick="event.stopPropagation()">ⓘ</span>`;
+}
+
+function yieldGapNote(comparison) {
+  if (!comparison || !comparison.material) return null;
+  const special = !!comparison.possibleSpecialDividend;
+  if (comparison.direction === 'forward_higher') {
+    return {
+      label: 'Possible raise',
+      tooltip: special
+        ? 'The forward yield is higher, so the dividend has likely been raised. There is also one payment much larger than the others, which could be a special dividend.'
+        : 'The forward yield is higher than the trailing 12-month yield. The company has likely raised the dividend, and that increase is not yet in the full year of payments.',
+    };
+  }
+  if (comparison.direction === 'trailing_higher') {
+    if (special) {
+      return {
+        label: 'Possible cut or special',
+        tooltip: 'The trailing 12-month yield is higher. One payment is unusually large and could be a special dividend, or the company has cut the dividend.',
+      };
+    }
+    return {
+      label: 'Possible cut',
+      tooltip: 'The trailing 12-month yield is higher than the forward yield. The company has likely cut the dividend.',
+    };
+  }
+  return null;
+}
+
+function yieldGapHTML(comparison) {
+  const note = yieldGapNote(comparison);
+  if (!note) return '';
+  return `<div class="yield-gap-note">${esc(note.label)} <span class="info-icon info-icon-inline" data-tooltip="${esc(note.tooltip)}" onclick="event.stopPropagation()">ⓘ</span></div>`;
+}
+
 function renderTrendBadge(trend) {
   const cfg = TREND_CFG[trend] || TREND_CFG.insufficient_data;
   return `<span class="score-badge trend-badge ${cfg.cls}">${cfg.icon} ${cfg.label}</span>`;
@@ -901,14 +958,23 @@ function renderResults(data) {
         const dt = DIVIDEND_MINI_TREND[dividendTrend] || DIVIDEND_MINI_TREND.insufficient_data;
         trendHTML = `<div class="div-trend-plain" style="color:${dt.color}">${dt.text}</div>`;
       }
+      const trailing = metrics.trailingDividendYield;
       return (
         `<div class="yield-slot">` +
+        `<div class="yield-pair">` +
         `<div class="mini-card">` +
-        `<span class="info-icon" data-tooltip="${esc(tooltip)}">ⓘ</span>` +
-        `<div class="m-label">DIV. YIELD</div>` +
+        `<span class="info-icon" data-tooltip="${esc(YIELD_FORWARD_TOOLTIP)}">ⓘ</span>` +
+        `<div class="m-label">Forward Yield</div>` +
         `<div class="m-value${valCls}">${displayVal}</div>` +
         `<span class="score-badge ${cfg.cls}">${cfg.label}</span>` +
         `</div>` +
+        `<div class="mini-card">` +
+        `<span class="info-icon" data-tooltip="${esc(YIELD_TRAILING_TOOLTIP)}">ⓘ</span>` +
+        `<div class="m-label">Trailing 12M Yield</div>` +
+        `<div class="m-value${trailing == null ? ' na' : ''}">${formatYieldPct(trailing)}</div>` +
+        `</div>` +
+        `</div>` +
+        yieldGapHTML(metrics.yieldComparison) +
         `<div class="mini-card">` +
         `<span class="info-icon" data-tooltip="${esc(divTooltip)}">ⓘ</span>` +
         `<div class="m-label">DIVIDEND</div>` +
@@ -2046,7 +2112,7 @@ function exportWatchlistCSV() {
   const wl = getWatchlist();
   if (!wl.length) return;
   const today   = new Date().toISOString().split('T')[0];
-  const headers = ['Ticker', 'Company', 'Sector', 'Recommendation', 'Div. Yield (%)', 'PER', 'Dividend Trend', 'Notes'];
+  const headers = ['Ticker', 'Company', 'Sector', 'Recommendation', 'Forward Yield (%)', 'Trailing 12M Yield (%)', 'PER', 'Dividend Trend', 'Notes'];
   const rows    = wl.map(item => {
     const sector = mapSector(item.sector, item.industry || '', item.symbol);
     const rec    = REC_BADGE_CFG[item.recommendation]?.label || item.recommendation || '';
@@ -2057,6 +2123,7 @@ function exportWatchlistCSV() {
       sector,
       rec,
       item.divYield != null ? item.divYield.toFixed(2) : '',
+      item.trailingDivYield != null ? item.trailingDivYield.toFixed(2) : '',
       item.per      != null ? item.per.toFixed(1)      : '',
       trend,
       item.notes || '',
@@ -2112,6 +2179,8 @@ document.body.appendChild(globalTooltip);
 
 function attachTooltipListeners() {
   document.querySelectorAll('.info-icon').forEach(icon => {
+    if (icon.dataset.tipBound === '1') return;
+    icon.dataset.tipBound = '1';
     icon.addEventListener('mouseenter', () => {
       globalTooltip.innerHTML = icon.dataset.tooltip;
       globalTooltip.style.opacity = '1';

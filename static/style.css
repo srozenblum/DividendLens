@@ -575,7 +575,7 @@ body.has-results .results-state { display: block; }
 /* ===== Metrics Grid ===== */
 .metrics-grid {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: 10px;
   margin-bottom: 24px;
 }
@@ -1406,6 +1406,30 @@ input[type="date"].form-input::-webkit-calendar-picker-indicator { filter: inver
   display: flex;
   flex-direction: column;
   gap: 8px;
+  grid-column: span 2;
+}
+.yield-pair {
+  display: flex;
+  gap: 8px;
+}
+.yield-pair .mini-card {
+  flex: 1;
+  min-width: 0;
+}
+.yield-pair .m-label {
+  padding-right: 16px;
+  min-height: 2.4em;
+}
+.yield-gap-note {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-muted);
+  padding: 0 2px;
+}
+.info-icon-inline {
+  position: static;
+  margin-left: 2px;
+  vertical-align: baseline;
 }
 
 .mini-card {
