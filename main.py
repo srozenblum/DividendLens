@@ -5,6 +5,7 @@ import math
 import datetime
 import json
 import re
+import statistics
 
 app = FastAPI()
 
@@ -72,7 +73,10 @@ def score_stock(info: dict, debt_to_ebitda, min_yield: float = 4.0, max_per: flo
     else:
         per_score = "buy" if per < max_per else ("neutral" if per <= 20 else "expensive")
 
-    # Yield scoring
+    # Yield scoring uses the forward yield (dividendRate / price, with the
+    # existing dividendYield fallback). The trailing 12-month yield is
+    # display-only. REIT "buy" is y > 5; every other profile uses min_yield
+    # (default 4).
     dividend_rate = safe_float(info.get("dividendRate")) or safe_float(info.get("lastDividendValue"))
     current_price = safe_float(info.get("currentPrice")) or safe_float(info.get("regularMarketPrice"))
     if dividend_rate and current_price and current_price > 0:
@@ -363,6 +367,14 @@ async def analyze_ticker(ticker: str, min_yield: float = 4.0, max_per: float = 1
         ptb = safe_float(info.get("priceToBook"))
         scores = score_stock(info, debt_to_ebitda, min_yield, max_per)
         dividend_trend = dividend_growth_trend(stock)
+        try:
+            yield_summary = summarize_dividend_yields(
+                stock.dividends,
+                current_price_val,
+                dividend_yield,
+            )
+        except Exception:
+            yield_summary = empty_yield_summary()
 
         return {
             "companyName": info.get("longName") or info.get("shortName") or ticker.upper(),
@@ -375,6 +387,8 @@ async def analyze_ticker(ticker: str, min_yield: float = 4.0, max_per: float = 1
             "metrics": {
                 "per": round(per_raw, 2) if per_raw is not None else None,
                 "dividendYield": dividend_yield,
+                "trailingDividendYield": yield_summary["trailingDividendYield"],
+                "yieldComparison": yield_summary["yieldComparison"],
                 "payoutRatio": round(payout * 100, 2) if payout is not None else None,
                 "priceToBook": round(ptb, 2) if ptb is not None else None,
                 "debtToEbitda": round(debt_to_ebitda, 2) if debt_to_ebitda is not None else None,
@@ -523,6 +537,176 @@ def normalize_transactions(transactions) -> list:
         signed = -shares if side in ("sell", "sale") else shares
         normalized.append((date_str, signed))
     return normalized
+
+
+# A note is shown when either gap is exceeded: more than 1 percentage
+# point, or more than 20% of the larger yield. Landing exactly on one
+# threshold does not count for that threshold. A gap of exactly 1.0 point
+# on a small yield can still qualify through the 20% rule.
+YIELD_GAP_ABS_POINTS = 1.0
+YIELD_GAP_REL = 0.20
+
+# One payment is a possible special dividend when it is the only payment in
+# the trailing window at least this many times the median of the others.
+# A repeated higher amount is a raise, not a special.
+SPECIAL_DIVIDEND_MULTIPLE = 2.0
+TRAILING_WINDOW_DAYS = 365
+
+
+def empty_yield_summary():
+    return {
+        "trailingDividendYield": None,
+        "yieldComparison": {
+            "material": False,
+            "direction": None,
+            "possibleSpecialDividend": False,
+        },
+    }
+
+
+def _dividend_payments(divs):
+    """(ex-date, amount) rows from a yfinance dividends series or a mapping.
+
+    Non-positive and non-numeric amounts are skipped. The date is the
+    exchange wall-clock ex-date, same rule as the dividend ledger.
+    """
+    if divs is None:
+        return []
+    try:
+        if len(divs) == 0:
+            return []
+    except TypeError:
+        return []
+    items = divs.items() if hasattr(divs, "items") else divs
+    payments = []
+    for ts, amount in items:
+        value = safe_float(amount)
+        if value is None or value <= 0:
+            continue
+        try:
+            ex_date = _ex_dividend_date(ts)
+        except (TypeError, ValueError):
+            continue
+        payments.append((ex_date, value))
+    return payments
+
+
+def trailing_window_payments(divs, as_of=None, window_days=TRAILING_WINDOW_DAYS):
+    """Payments with an ex-date in (as_of - window_days, as_of].
+
+    A dividend dated exactly `window_days` earlier is outside the window.
+    `as_of` defaults to today. This is the trailing 12 months as 365 days,
+    not Yahoo's trailingAnnualDividendYield.
+    """
+    if isinstance(as_of, datetime.datetime):
+        as_of = as_of.date()
+    as_of = as_of or datetime.date.today()
+    start = as_of - datetime.timedelta(days=window_days)
+    selected = [
+        (ex_date, amount)
+        for ex_date, amount in _dividend_payments(divs)
+        if start < ex_date <= as_of
+    ]
+    selected.sort(key=lambda item: item[0])
+    return selected
+
+
+def _same_dividend_amount(amount, other):
+    """True when two payments are the same amount, allowing a 1% tick of noise."""
+    scale = max(abs(other), abs(amount), 1e-9)
+    return abs(amount - other) <= 0.01 * scale
+
+
+def _amounts_without_dust(amounts):
+    """Drop token payments that are tiny beside the regular dividend.
+
+    A 0.005 adjustment next to ordinary payments pulls the baseline down
+    and can make a normal larger instalment look like a special. With
+    fewer than three payments the list is left as-is, so one regular
+    payment plus one much larger one can still be a special.
+    """
+    if len(amounts) < 3:
+        return amounts
+    ordered = sorted(amounts)
+    upper = ordered[len(ordered) // 2:]
+    scale = statistics.median(upper)
+    if scale <= 0:
+        return amounts
+    kept = [amount for amount in amounts if amount >= 0.15 * scale]
+    return kept if len(kept) >= 2 else amounts
+
+
+def possible_special_dividend(payments) -> bool:
+    """True when a single trailing-window payment is unusually large.
+
+    The largest amount has to be alone (a repeated new amount is a raise or
+    the old rate in a cut) and at least SPECIAL_DIVIDEND_MULTIPLE times the
+    median of the other payments. Two payments are enough: one regular and
+    one much larger. Tiny payments are ignored when there is a clearer
+    regular dividend beside them.
+    """
+    amounts = _amounts_without_dust([amount for _, amount in payments if amount > 0])
+    if len(amounts) < 2:
+        return False
+    largest = max(amounts)
+    peers = [amount for amount in amounts if _same_dividend_amount(amount, largest)]
+    if len(peers) != 1:
+        return False
+    others = [amount for amount in amounts if not _same_dividend_amount(amount, largest)]
+    if not others:
+        return False
+    baseline = statistics.median(others)
+    if baseline <= 0:
+        return False
+    return largest >= SPECIAL_DIVIDEND_MULTIPLE * baseline
+
+
+def yields_differ_materially(forward_yield, trailing_yield) -> bool:
+    """True when the two yields are far enough apart to be worth a note.
+
+    Either gap qualifies: more than YIELD_GAP_ABS_POINTS (1 percentage
+    point), or more than YIELD_GAP_REL (20%) of the larger yield. Exactly
+    1.0 point does not by itself qualify, and exactly 20% does not either,
+    but a 1.0 point gap on a yield below 5% still qualifies on the relative
+    rule. A missing yield never qualifies.
+    """
+    forward = safe_float(forward_yield)
+    trailing = safe_float(trailing_yield)
+    if forward is None or trailing is None:
+        return False
+    diff = abs(forward - trailing)
+    larger = max(abs(forward), abs(trailing))
+    if larger <= 0:
+        return False
+    return diff > YIELD_GAP_ABS_POINTS or (diff / larger) > YIELD_GAP_REL
+
+
+def summarize_dividend_yields(divs, current_price, forward_yield, as_of=None) -> dict:
+    """Trailing yield from dividend history, plus the gap versus forward.
+
+    Trailing yield = sum of dividends with ex-dates in the last 365 days
+    / current price * 100. None when that sum is empty or the price is
+    missing. `forward_yield` is the figure already shown today
+    (dividendRate / price). Scoring does not read this result.
+    """
+    summary = empty_yield_summary()
+    payments = trailing_window_payments(divs, as_of=as_of)
+    price = safe_float(current_price)
+    if payments and price is not None and price > 0:
+        total = sum(amount for _, amount in payments)
+        summary["trailingDividendYield"] = round((total / price) * 100, 2)
+    trailing = summary["trailingDividendYield"]
+    forward = safe_float(forward_yield)
+    material = yields_differ_materially(forward, trailing)
+    direction = None
+    if material:
+        direction = "forward_higher" if forward > trailing else "trailing_higher"
+    summary["yieldComparison"] = {
+        "material": material,
+        "direction": direction,
+        "possibleSpecialDividend": possible_special_dividend(payments),
+    }
+    return summary
 
 
 def _ex_dividend_date(ts):
