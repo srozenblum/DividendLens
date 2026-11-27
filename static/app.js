@@ -1073,6 +1073,96 @@ function savePortfolio(portfolio) {
   localStorage.setItem('portfolio', JSON.stringify(portfolio));
 }
 
+// Records saved before sales existed have no type — those are buys.
+function isSale(t) {
+  return !!(t && t.type === 'sell');
+}
+
+// Positions smaller than this are float dust, not a real holding.
+const SHARE_DUST = 0.00005;
+
+function netShares(transactions) {
+  let n = 0;
+  for (const t of transactions) {
+    n += isSale(t) ? -Number(t.shares) : Number(t.shares);
+  }
+  return n;
+}
+
+// Buys settle before sells on the same day, so a same-day round trip is valid.
+function holdingsStayNonNegative(transactions) {
+  const events = transactions.map(t => ({
+    date: t.date,
+    delta: isSale(t) ? -Number(t.shares) : Number(t.shares),
+    sell: isSale(t) ? 1 : 0,
+  }));
+  events.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.sell - b.sell));
+  let balance = 0;
+  for (const e of events) {
+    balance += e.delta;
+    if (balance < -1e-6) return false;
+  }
+  return true;
+}
+
+function positionSummaries(portfolio) {
+  const bySymbol = {};
+  for (const t of portfolio) {
+    if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
+    bySymbol[t.symbol].push(t);
+  }
+  return Object.keys(bySymbol).map(symbol => {
+    const txns = bySymbol[symbol];
+    const buys = txns.filter(t => !isSale(t));
+    const meta = buys[0] || txns[0];
+    const totalSharesBought = buys.reduce((s, p) => s + Number(p.shares), 0);
+    const totalCost = buys.reduce((s, p) => s + Number(p.amountEUR || 0), 0);
+    const remaining = netShares(txns);
+    const open = remaining > SHARE_DUST;
+    const avg = totalSharesBought > 0 ? totalCost / totalSharesBought : 0;
+    return {
+      symbol,
+      companyName: meta.companyName,
+      sector: meta.sector,
+      industry: meta.industry || '',
+      totalCost,
+      remainingShares: remaining,
+      remainingCost: open ? avg * remaining : 0,
+      avgPrice: avg,
+      purchases: buys.length,
+      closed: !open,
+      transactions: txns,
+    };
+  });
+}
+
+// One entry per symbol, including positions that have been fully sold.
+// Dividend dates are matched against these buy and sell dates.
+function dividendCompanies(portfolio) {
+  const map = {};
+  for (const p of portfolio) {
+    if (!map[p.symbol]) {
+      map[p.symbol] = {
+        symbol: p.symbol,
+        companyName: p.companyName,
+        sector: p.sector || '',
+        transactions: [],
+      };
+    }
+    const co = map[p.symbol];
+    if (!isSale(p)) {
+      if (p.companyName) co.companyName = p.companyName;
+      if (p.sector) co.sector = p.sector;
+    }
+    co.transactions.push({
+      date: p.date,
+      shares: Number(p.shares),
+      side: isSale(p) ? 'sell' : 'buy',
+    });
+  }
+  return Object.values(map).filter(co => co.transactions.some(t => t.side === 'buy'));
+}
+
 
 // ===== Portfolio Sector Migration =====
 
@@ -1170,16 +1260,11 @@ function renderPortfolioSummaryCards(portfolio) {
 
   if (!portfolio.length) { container.innerHTML = ''; return; }
 
-  const totalInvested  = portfolio.reduce((s, p) => s + p.amountEUR, 0);
-  const companies      = new Set(portfolio.map(p => p.symbol)).size;
-  const numPurchases   = portfolio.length;
-
-  const companyTotals = {};
-  for (const p of portfolio) {
-    if (!companyTotals[p.symbol]) companyTotals[p.symbol] = { name: p.companyName, total: 0 };
-    companyTotals[p.symbol].total += p.amountEUR;
-  }
-  const largest = Object.values(companyTotals).sort((a, b) => b.total - a.total)[0];
+  const open = positionSummaries(portfolio).filter(c => !c.closed);
+  const totalInvested = open.reduce((s, c) => s + c.remainingCost, 0);
+  const companies     = open.length;
+  const numPurchases  = portfolio.filter(p => !isSale(p)).length;
+  const largest       = [...open].sort((a, b) => b.remainingCost - a.remainingCost)[0];
 
   const sym    = getCurrencySymbol();
   const fmtEur = v => sym + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -1188,7 +1273,7 @@ function renderPortfolioSummaryCards(portfolio) {
     { label: 'Total Invested',              value: fmtEur(totalInvested),             id: null,                  accent: false },
     { label: 'Number of Companies',         value: String(companies),                 id: null,                  accent: false },
     { label: 'Number of Purchases',         value: String(numPurchases),              id: null,                  accent: false },
-    { label: 'Largest Position',            value: largest ? largest.name : '—',     id: null,                  accent: false },
+    { label: 'Largest Position',            value: largest ? largest.companyName : '—', id: null,               accent: false },
     { label: '💰 Total Dividends Received', value: '—',                              id: 'dividend-total-card', accent: true  },
   ];
 
@@ -1204,15 +1289,17 @@ function renderPortfolioSectorChart(portfolio) {
   const card = document.getElementById('portfolio-sector-chart');
   if (!card) return;
 
-  if (!portfolio.length) { card.style.display = 'none'; return; }
-  card.style.display = 'block';
+  const open = positionSummaries(portfolio).filter(c => !c.closed);
+  if (!open.length) { card.style.display = 'none'; return; }
 
   const sectorTotals = {};
-  for (const p of portfolio) {
-    const sec = p.sector || 'Other';
-    sectorTotals[sec] = (sectorTotals[sec] || 0) + p.amountEUR;
+  for (const c of open) {
+    const sec = c.sector || 'Other';
+    sectorTotals[sec] = (sectorTotals[sec] || 0) + c.remainingCost;
   }
-  const total   = Object.values(sectorTotals).reduce((a, b) => a + b, 0);
+  const total = Object.values(sectorTotals).reduce((a, b) => a + b, 0);
+  if (total <= 0) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
   const sectors = Object.entries(sectorTotals).sort((a, b) => b[1] - a[1]);
   const labels  = sectors.map(([s]) => s);
   const values  = sectors.map(([, v]) => Math.round((v / total) * 1000) / 10);
@@ -1293,18 +1380,28 @@ function renderPortfolioPurchasesTable(portfolio) {
   if (!sorted.length && (portfolioSearchQuery || portfolioSectorFilter)) {
     bodyHTML = `<p class="empty-state-view">No results for this filter.</p>`;
   } else {
-    const rows = sorted.map(p =>
-      `<tr>` +
-      `<td>${esc(formatDate(p.date))}</td>` +
-      `<td class="td-ticker-portfolio" onclick="analyzeStock('${esc(p.symbol)}')"><span class="wl-ticker">${esc(p.symbol)}<span class="ticker-goto-icon">↗</span></span></td>` +
-      `<td class="td-company">${esc(p.companyName)}</td>` +
-      `<td>${esc(p.sector)}</td>` +
-      `<td>${fmtEur(p.amountEUR)}</td>` +
-      `<td>${fmtEur(p.pricePerShare)}</td>` +
-      `<td>${p.exactSharesProvided ? p.shares.toFixed(4) : `<span style="color:var(--text-muted)">~</span>${p.shares.toFixed(4)}`}</td>` +
-      `<td><button class="table-btn-remove" title="Delete" onclick="event.stopPropagation();deletePurchase('${esc(p.id)}')">×</button></td>` +
-      `</tr>`
-    ).join('');
+    const rows = sorted.map(p => {
+      const sale = isSale(p);
+      const amount = sale || p.amountEUR == null ? '—' : fmtEur(p.amountEUR);
+      const price  = sale || p.pricePerShare == null ? '—' : fmtEur(p.pricePerShare);
+      const shares = sale
+        ? `<span class="tx-sell">Sell</span>−${Number(p.shares).toFixed(4)}`
+        : (p.exactSharesProvided
+          ? Number(p.shares).toFixed(4)
+          : `<span style="color:var(--text-muted)">~</span>${Number(p.shares).toFixed(4)}`);
+      return (
+        `<tr>` +
+        `<td>${esc(formatDate(p.date))}</td>` +
+        `<td class="td-ticker-portfolio" onclick="analyzeStock('${esc(p.symbol)}')"><span class="wl-ticker">${esc(p.symbol)}<span class="ticker-goto-icon">↗</span></span></td>` +
+        `<td class="td-company">${esc(p.companyName)}</td>` +
+        `<td>${esc(p.sector)}</td>` +
+        `<td>${amount}</td>` +
+        `<td>${price}</td>` +
+        `<td>${shares}</td>` +
+        `<td><button class="table-btn-remove" title="Delete" onclick="event.stopPropagation();deletePurchase('${esc(p.id)}')">×</button></td>` +
+        `</tr>`
+      );
+    }).join('');
 
     bodyHTML =
       `<div class="table-wrap"><table class="data-table">` +
@@ -1326,9 +1423,19 @@ function togglePurchaseDateSort() {
 }
 
 function deletePurchase(id) {
-  if (!confirm('Delete this purchase?')) return;
-  savePortfolio(getPortfolio().filter(p => p.id !== id));
+  const portfolio = getPortfolio();
+  const target = portfolio.find(p => p.id === id);
+  if (!target) return;
+  if (!confirm(isSale(target) ? 'Delete this sale?' : 'Delete this purchase?')) return;
+  const next = portfolio.filter(p => p.id !== id);
+  const symbolTx = next.filter(p => p.symbol === target.symbol);
+  if (!holdingsStayNonNegative(symbolTx)) {
+    alert('This purchase can’t be deleted because shares from it were already sold. Delete the sale first.');
+    return;
+  }
+  savePortfolio(next);
   _dividendsTabCache = null;
+  _dividendsCache = null;
   renderPortfolio();
 }
 
@@ -1337,17 +1444,9 @@ function renderPortfolioCompanySummary(portfolio) {
   if (!container) return;
   if (!portfolio.length) { container.innerHTML = ''; return; }
 
-  const companies = {};
-  for (const p of portfolio) {
-    if (!companies[p.symbol]) {
-      companies[p.symbol] = { symbol: p.symbol, companyName: p.companyName, sector: p.sector, totalAmount: 0, totalShares: 0, purchases: 0 };
-    }
-    companies[p.symbol].totalAmount += p.amountEUR;
-    companies[p.symbol].totalShares += p.shares;
-    companies[p.symbol].purchases   += 1;
-  }
-
-  let sorted = Object.values(companies).sort((a, b) => b.totalAmount - a.totalAmount);
+  let sorted = positionSummaries(portfolio)
+    .filter(c => !c.closed)
+    .sort((a, b) => b.remainingCost - a.remainingCost);
 
   if (portfolioSearchQuery) {
     sorted = sorted.filter(c =>
@@ -1369,32 +1468,33 @@ function renderPortfolioCompanySummary(portfolio) {
     `</div>`;
 
   if (!sorted.length) {
-    container.innerHTML = headerHTML +
-      `<p class="empty-state-view">No results for '${esc(portfolioSearchQuery)}'</p>`;
+    const filtered = portfolioSearchQuery || portfolioSectorFilter;
+    const msg = filtered
+      ? `No results for '${esc(portfolioSearchQuery || portfolioSectorFilter)}'`
+      : 'No open positions. Dividends already received stay in the Dividends tab.';
+    container.innerHTML = headerHTML + `<p class="empty-state-view">${msg}</p>`;
     return;
   }
 
-  const rows = sorted.map(c => {
-    const avg = c.totalAmount / c.totalShares;
-    return (
-      `<tr class="table-row-clickable" onclick="analyzeStock('${esc(c.symbol)}')">` +
-      `<td class="td-ticker-portfolio"><span class="wl-ticker">${esc(c.symbol)}<span class="ticker-goto-icon">↗</span></span></td>` +
-      `<td class="td-company">${esc(c.companyName)}</td>` +
-      `<td>${esc(c.sector)}</td>` +
-      `<td>${fmtEur(c.totalAmount)}</td>` +
-      `<td>${c.purchases}</td>` +
-      `<td>${fmtEur(avg)}</td>` +
-      `<td>${c.totalShares.toFixed(2)}</td>` +
-      `</tr>`
-    );
-  }).join('');
+  const rows = sorted.map(c => (
+    `<tr class="table-row-clickable" onclick="analyzeStock('${esc(c.symbol)}')">` +
+    `<td class="td-ticker-portfolio"><span class="wl-ticker">${esc(c.symbol)}<span class="ticker-goto-icon">↗</span></span></td>` +
+    `<td class="td-company">${esc(c.companyName)}</td>` +
+    `<td>${esc(c.sector)}</td>` +
+    `<td>${fmtEur(c.remainingCost)}</td>` +
+    `<td>${c.purchases}</td>` +
+    `<td>${fmtEur(c.avgPrice)}</td>` +
+    `<td>${c.remainingShares.toFixed(2)}</td>` +
+    `<td><button class="table-btn-sell" onclick="event.stopPropagation();openSellModal('${esc(c.symbol)}')">Sell</button></td>` +
+    `</tr>`
+  )).join('');
 
   container.innerHTML =
     headerHTML +
     `<div class="table-wrap"><table class="data-table">` +
     `<thead><tr>` +
     `<th>Ticker</th><th>Company</th><th>Sector</th>` +
-    `<th>Total Invested (${getCurrencySymbol()})</th><th>Purchases</th><th>Avg. Price/Share</th><th>Total Shares</th>` +
+    `<th>Total Invested (${getCurrencySymbol()})</th><th>Purchases</th><th>Avg. Price/Share</th><th>Total Shares</th><th></th>` +
     `</tr></thead>` +
     `<tbody>${rows}</tbody>` +
     `</table></div>`;
@@ -1408,7 +1508,7 @@ function _dividendsSectionShell() {
     `<div class="section-title-row">` +
     `<h3 class="section-title">Dividends Received</h3>` +
     `</div>` +
-    `<p class="dividends-section-note">Based on shares held since first purchase date. Actual amounts may vary depending on exact purchase timing.</p>`
+    `<p class="dividends-section-note">Each payment uses the shares held before that ex-dividend date. Later purchases and sales do not change payments already received.</p>`
   );
 }
 
@@ -1427,30 +1527,15 @@ function _dividendsSkeleton(count) {
   );
 }
 
-async function renderPortfolioDividendsReceived(portfolio) {
-  const container = document.getElementById('portfolio-dividends-container');
-  if (!container) return;
-
-  _dividendsCache = null;
-
-  if (!portfolio.length) return;
-
-  // Build per-company data: earliest purchase date and total shares
-  const companyMap = {};
-  for (const p of portfolio) {
-    if (!companyMap[p.symbol]) {
-      companyMap[p.symbol] = { symbol: p.symbol, companyName: p.companyName, sector: p.sector || '', totalShares: 0, earliestDate: p.date };
-    }
-    companyMap[p.symbol].totalShares += p.shares;
-    if (p.date < companyMap[p.symbol].earliestDate) companyMap[p.symbol].earliestDate = p.date;
-  }
-  const companyList = Object.values(companyMap);
-
-  // Fetch dividends for all companies in parallel (max 5 concurrent)
+async function fetchDividendsReceived(portfolio) {
+  const companyList = dividendCompanies(portfolio);
   const results = {};
   await asyncPool(5, companyList, async (co) => {
     try {
-      const params = new URLSearchParams({ symbol: co.symbol, from_date: co.earliestDate, shares: String(co.totalShares) });
+      const params = new URLSearchParams({
+        symbol: co.symbol,
+        transactions: JSON.stringify(co.transactions),
+      });
       const res = await fetch(`/api/dividends-received?${params}`);
       if (!res.ok) throw new Error();
       results[co.symbol] = await res.json();
@@ -1458,8 +1543,28 @@ async function renderPortfolioDividendsReceived(portfolio) {
       results[co.symbol] = { dividends: [], totalReceived: 0, currency: 'USD' };
     }
   });
+  return { companyList, results };
+}
 
-  _dividendsCache = { companyList, results };
+async function renderPortfolioDividendsReceived(portfolio) {
+  _dividendsCache = null;
+
+  if (!portfolio.length) return;
+
+  // Reuse Dividends-tab cache if already populated (same data)
+  if (_dividendsTabCache) {
+    _dividendsCache = _dividendsTabCache;
+    _renderDividendsFromCache();
+    return;
+  }
+
+  // Show loading indicator while data is being fetched
+  const cardEl = document.getElementById('dividend-total-card');
+  if (cardEl) cardEl.textContent = '...';
+
+  const data = await fetchDividendsReceived(portfolio);
+  _dividendsCache = data;
+  _dividendsTabCache = data;
   _renderDividendsFromCache();
 }
 
@@ -1488,29 +1593,9 @@ async function renderDividendsView() {
     container.innerHTML = '<div class="loading"><div class="spinner"></div><div>Loading dividend data…</div></div>';
   }
 
-  const companyMap = {};
-  for (const p of portfolio) {
-    if (!companyMap[p.symbol]) {
-      companyMap[p.symbol] = { symbol: p.symbol, companyName: p.companyName, totalShares: 0, earliestDate: p.date };
-    }
-    companyMap[p.symbol].totalShares += p.shares;
-    if (p.date < companyMap[p.symbol].earliestDate) companyMap[p.symbol].earliestDate = p.date;
-  }
-  const companyList = Object.values(companyMap);
-
-  const results = {};
-  await asyncPool(5, companyList, async (co) => {
-    try {
-      const params = new URLSearchParams({ symbol: co.symbol, from_date: co.earliestDate, shares: String(co.totalShares) });
-      const res = await fetch(`/api/dividends-received?${params}`);
-      if (!res.ok) throw new Error();
-      results[co.symbol] = await res.json();
-    } catch (_) {
-      results[co.symbol] = { dividends: [], totalReceived: 0 };
-    }
-  });
-
-  _dividendsTabCache = { companyList, results };
+  const data = await fetchDividendsReceived(portfolio);
+  _dividendsTabCache = data;
+  _dividendsCache = data;
   _renderDividendsTabContent();
 }
 
@@ -1541,6 +1626,7 @@ function _renderDividendsTabContent() {
         date:        pmt.date,
         symbol:      co.symbol,
         companyName: co.companyName,
+        shares:      pmt.shares,
         gross:       pmt.totalAmount,
         net:         pmt.totalAmount * (1 - tax / 100),
       });
@@ -1695,7 +1781,7 @@ function _renderDivPaymentsTable(filtered, allPayments, sym, fmtAmt, tax) {
       const year = pmt.date.slice(0, 4);
       if (year !== currentYear) {
         currentYear = year;
-        rowsHTML += `<tr class="div-year-separator-row"><td colspan="6">${esc(year)}</td></tr>`;
+        rowsHTML += `<tr class="div-year-separator-row"><td colspan="7">${esc(year)}</td></tr>`;
       }
       rowsHTML += _divPaymentRowHTML(pmt, fmtAmt, tax);
     }
@@ -1708,7 +1794,7 @@ function _renderDivPaymentsTable(filtered, allPayments, sym, fmtAmt, tax) {
     `<div class="table-wrap"><table class="data-table">` +
     `<thead><tr>` +
     `<th class="sortable" onclick="toggleDivTabDateSort()">Date <span class="sort-indicator active">${sortIcon}</span></th>` +
-    `<th>Ticker</th><th>Company</th>` +
+    `<th>Ticker</th><th>Company</th><th>Shares</th>` +
     `<th>Amount (gross)</th><th>Tax</th><th>Amount (net)</th>` +
     `</tr></thead>` +
     `<tbody>${rowsHTML}</tbody>` +
@@ -1722,6 +1808,7 @@ function _divPaymentRowHTML(pmt, fmtAmt, tax) {
     `<td class="td-ticker-portfolio" onclick="analyzeStock('${esc(pmt.symbol)}')">` +
     `<span class="wl-ticker">${esc(pmt.symbol)}<span class="ticker-goto-icon">↗</span></span></td>` +
     `<td class="td-company">${esc(pmt.companyName)}</td>` +
+    `<td>${pmt.shares != null ? Number(pmt.shares).toFixed(4) : '—'}</td>` +
     `<td>${fmtAmt(pmt.gross)}</td>` +
     `<td>${tax}%</td>` +
     `<td>${fmtAmt(pmt.net)}</td>` +
@@ -1857,6 +1944,83 @@ function showModalError(msg) {
 }
 
 
+// ===== Sell Modal =====
+
+let sellTarget = null;
+
+function openSellModal(symbol) {
+  const summary = positionSummaries(getPortfolio()).find(c => c.symbol === symbol && !c.closed);
+  if (!summary) return;
+  sellTarget = summary;
+  document.getElementById('sell-company-label').textContent = `${summary.symbol} — ${summary.companyName}`;
+  document.getElementById('sell-date').value = new Date().toISOString().split('T')[0];
+  document.getElementById('sell-shares').value = String(Math.round(summary.remainingShares * 1e6) / 1e6);
+  document.getElementById('sell-hint').textContent =
+    `You currently hold ${summary.remainingShares.toFixed(4)} shares. Dividends already received stay in your history; this sale only reduces shares for later payments.`;
+  document.getElementById('sell-error').classList.add('hidden');
+  document.getElementById('sell-overlay').classList.remove('hidden');
+  document.getElementById('sell-modal').classList.remove('hidden');
+  document.getElementById('sell-shares').focus();
+}
+
+function closeSellModal() {
+  sellTarget = null;
+  document.getElementById('sell-overlay').classList.add('hidden');
+  document.getElementById('sell-modal').classList.add('hidden');
+}
+
+function showSellError(msg) {
+  const el = document.getElementById('sell-error');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function submitSell() {
+  if (!sellTarget) return;
+  const errorEl = document.getElementById('sell-error');
+  errorEl.classList.add('hidden');
+
+  const dateVal = document.getElementById('sell-date').value;
+  const shares = parseFloat(document.getElementById('sell-shares').value);
+  if (!dateVal) {
+    showSellError('Please select a sale date.');
+    return;
+  }
+  if (!shares || shares <= 0) {
+    showSellError('Please enter a number of shares greater than 0.');
+    return;
+  }
+
+  const existing = getPortfolio().filter(p => p.symbol === sellTarget.symbol);
+  const candidate = existing.concat([{ type: 'sell', date: dateVal, shares }]);
+  if (!holdingsStayNonNegative(candidate)) {
+    showSellError('That sale exceeds the shares you held on that date.');
+    return;
+  }
+
+  const sale = {
+    id:          String(Date.now()),
+    type:        'sell',
+    symbol:      sellTarget.symbol,
+    companyName: sellTarget.companyName,
+    sector:      sellTarget.sector,
+    industry:    sellTarget.industry || '',
+    date:        dateVal,
+    shares,
+  };
+
+  const portfolio = getPortfolio();
+  portfolio.push(sale);
+  savePortfolio(portfolio);
+
+  _dividendsTabCache = null;
+  _dividendsCache = null;
+  closeSellModal();
+  if (currentView === 'portfolio') renderPortfolio();
+  if (currentView === 'dividends') renderDividendsView();
+}
+
+
 // ===== CSV Export =====
 
 function exportCSV(filename, headers, rows) {
@@ -1914,32 +2078,28 @@ function exportPurchasesCSV() {
     p.symbol,
     p.companyName,
     p.sector,
-    p.amountEUR.toFixed(2),
-    p.pricePerShare.toFixed(4),
-    p.shares.toFixed(2),
+    isSale(p) || p.amountEUR == null ? '' : Number(p.amountEUR).toFixed(2),
+    isSale(p) || p.pricePerShare == null ? '' : Number(p.pricePerShare).toFixed(4),
+    (isSale(p) ? -Number(p.shares) : Number(p.shares)).toFixed(2),
   ]);
   exportCSV(`dividend_lens_purchases_${today}.csv`, headers, rows);
 }
 
 function exportSummaryCSV() {
-  const portfolio = getPortfolio();
-  if (!portfolio.length) return;
-  const today     = new Date().toISOString().split('T')[0];
-  const headers   = ['Ticker', 'Company', 'Sector', 'Total Invested (EUR)', 'Purchases', 'Avg Price/Share', 'Total Shares'];
-  const companies = {};
-  for (const p of portfolio) {
-    if (!companies[p.symbol]) {
-      companies[p.symbol] = { symbol: p.symbol, companyName: p.companyName, sector: p.sector, totalAmount: 0, totalShares: 0, purchases: 0 };
-    }
-    companies[p.symbol].totalAmount += p.amountEUR;
-    companies[p.symbol].totalShares += p.shares;
-    companies[p.symbol].purchases   += 1;
-  }
-  const sorted = Object.values(companies).sort((a, b) => b.totalAmount - a.totalAmount);
-  const rows   = sorted.map(c => {
-    const avg = c.totalAmount / c.totalShares;
-    return [c.symbol, c.companyName, c.sector, c.totalAmount.toFixed(2), String(c.purchases), avg.toFixed(4), c.totalShares.toFixed(2)];
-  });
+  const open = positionSummaries(getPortfolio()).filter(c => !c.closed);
+  if (!open.length) return;
+  const today   = new Date().toISOString().split('T')[0];
+  const headers = ['Ticker', 'Company', 'Sector', 'Total Invested (EUR)', 'Purchases', 'Avg Price/Share', 'Total Shares'];
+  const sorted  = [...open].sort((a, b) => b.remainingCost - a.remainingCost);
+  const rows    = sorted.map(c => [
+    c.symbol,
+    c.companyName,
+    c.sector,
+    c.remainingCost.toFixed(2),
+    String(c.purchases),
+    c.avgPrice.toFixed(4),
+    c.remainingShares.toFixed(2),
+  ]);
   exportCSV(`dividend_lens_summary_${today}.csv`, headers, rows);
 }
 
@@ -2019,7 +2179,10 @@ document.addEventListener('click', e => {
 });
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeAddPurchaseModal();
+  if (e.key === 'Escape') {
+    closeAddPurchaseModal();
+    closeSellModal();
+  }
 });
 
 initSettings();
