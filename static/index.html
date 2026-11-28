@@ -70,7 +70,7 @@
         <span class="settings-label" style="margin-bottom:0">Buy Thresholds</span>
         <button onclick="resetThresholds()" class="reset-defaults-btn">↺ Reset</button>
       </div>
-      <p class="settings-sublabel">Customize when a stock is considered a buy</p>
+      <p class="settings-sublabel">Customize when a stock is considered a buy. A forward yield at or above the minimum counts, and a P/E at or below the maximum counts.</p>
 
       <div class="settings-field">
         <div class="settings-field-label">
@@ -105,7 +105,8 @@
         <div class="settings-tax-input-wrap">
           <input type="number" id="withholding-tax-input" class="settings-tax-input"
                  min="0" max="50" step="1" value="19"
-                 oninput="onWithholdingTaxInput(this.value)">
+                 oninput="onWithholdingTaxInput(this.value)"
+                 onblur="commitWithholdingTax()">
           <span class="settings-tax-suffix">%</span>
         </div>
         <p style="font-size:11px;color:var(--text-muted);margin-top:6px;font-style:italic;">Default 19% (Spain standard rate). Adjust based on your broker statements.</p>
@@ -313,6 +314,7 @@
   </div>
 
   <script src="scoring.js"></script>
+  <script src="withholding.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -10,6 +10,7 @@ import datetime
 import json
 import re
 import statistics
+from decimal import Decimal, ROUND_HALF_UP
 
 from yahoo_cache import (
     YAHOO_CONCURRENCY,
@@ -35,6 +36,23 @@ def safe_float(value):
         return None if (math.isnan(f) or math.isinf(f)) else f
     except (TypeError, ValueError):
         return None
+
+
+# Yield is printed to 2 decimals (4.00%) and P/E to 1 decimal (15.0x).
+# Score those displayed figures. 3.9999 is shown as 4.00% and must meet a
+# 4% minimum; 15.04 is shown as 15.0x and must meet a 15x cap.
+YIELD_DISPLAY_DECIMALS = 2
+PER_DISPLAY_DECIMALS = 1
+
+
+def displayed_number(value, digits):
+    """Round the way the page prints the figure (JavaScript Number.toFixed)."""
+    number = safe_float(value)
+    if number is None:
+        return None
+    quantum = Decimal(1).scaleb(-int(digits))
+    rounded = Decimal.from_float(number).quantize(quantum, rounding=ROUND_HALF_UP)
+    return float(rounded)
 
 
 def get_sector_profile(sector: str, industry: str) -> str:
@@ -159,17 +177,25 @@ def score_metrics(
     elif profile == "utility":
         per_score = "buy" if per < 18 else ("neutral" if per <= 22 else "expensive")
     else:
-        per_score = "buy" if per < max_per else ("neutral" if per <= 20 else "expensive")
+        # Default and oil. A P/E at or below max_per is a buy. 15.04 is
+        # shown as 15.0x, so it still meets a 15x cap.
+        shown_per = displayed_number(per, PER_DISPLAY_DECIMALS)
+        shown_cap = displayed_number(max_per, PER_DISPLAY_DECIMALS)
+        per_score = "buy" if shown_per <= shown_cap else ("neutral" if shown_per <= 20 else "expensive")
 
-    # dividend_yield is the forward yield. REIT "buy" is y > 5; every other
-    # profile uses min_yield (default 4). The trailing 12-month yield is
-    # display-only and does not change the recommendation.
+    # dividend_yield is the forward yield. REIT "buy" stays strictly above 5
+    # and ignores the slider. Every other profile is a buy at or above
+    # min_yield (default 4), using the 2 decimals the yield card shows.
+    # The trailing 12-month yield is display-only and does not change the
+    # recommendation.
     if dividend_yield is None:
         yield_score = "none"
     elif profile == "reit":
         yield_score = "buy" if dividend_yield > 5 else ("neutral" if dividend_yield >= 3 else "low")
     else:
-        yield_score = "buy" if dividend_yield > min_yield else ("neutral" if dividend_yield >= 2 else "low")
+        shown_yield = displayed_number(dividend_yield, YIELD_DISPLAY_DECIMALS)
+        shown_min = displayed_number(min_yield, YIELD_DISPLAY_DECIMALS)
+        yield_score = "buy" if shown_yield >= shown_min else ("neutral" if shown_yield >= 2 else "low")
 
     if debt_to_ebitda is None:
         debt_score = "unavailable"

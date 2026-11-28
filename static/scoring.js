@@ -6,6 +6,11 @@
 // dividendYield is a percent as well. minYield / maxPer are the settings
 // sliders; profiles with their own thresholds ignore the slider that does
 // not apply to them (see sectorProfile).
+//
+// A forward yield at or above the minimum is a buy, and a P/E at or below
+// the maximum is a buy. Compare the figures the page prints: yield to 2
+// decimals (4.00%) and P/E to 1 decimal (15.0x). 3.9999 is shown as 4.00%
+// and meets a 4% minimum; 15.04 is shown as 15.0x and meets a 15x cap.
 
 function sectorProfile(sector, industry) {
   const sec = String(sector || '').toLowerCase();
@@ -32,6 +37,14 @@ function finiteNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Same rounding as the cards: yield toFixed(2), P/E toFixed(1).
+function displayedNumber(value, digits) {
+  const n = finiteNumber(value);
+  if (n == null) return null;
+  const parsed = Number(n.toFixed(digits));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function scoreMetrics(input) {
   const src = input || {};
   const profile = sectorProfile(src.sector, src.industry);
@@ -53,12 +66,20 @@ function scoreMetrics(input) {
   else if (profile === 'bank') perScore = per < 10 ? 'buy' : (per <= 15 ? 'neutral' : 'expensive');
   else if (profile === 'tech') perScore = per < 20 ? 'buy' : (per <= 30 ? 'neutral' : 'expensive');
   else if (profile === 'utility') perScore = per < 18 ? 'buy' : (per <= 22 ? 'neutral' : 'expensive');
-  else perScore = per < maxP ? 'buy' : (per <= 20 ? 'neutral' : 'expensive');
+  else {
+    const shownPer = displayedNumber(per, 1);
+    const shownCap = displayedNumber(maxP, 1);
+    perScore = shownPer <= shownCap ? 'buy' : (shownPer <= 20 ? 'neutral' : 'expensive');
+  }
 
   let yieldScore;
   if (dividendYield == null) yieldScore = 'none';
   else if (profile === 'reit') yieldScore = dividendYield > 5 ? 'buy' : (dividendYield >= 3 ? 'neutral' : 'low');
-  else yieldScore = dividendYield > minY ? 'buy' : (dividendYield >= 2 ? 'neutral' : 'low');
+  else {
+    const shownYield = displayedNumber(dividendYield, 2);
+    const shownMin = displayedNumber(minY, 2);
+    yieldScore = shownYield >= shownMin ? 'buy' : (shownYield >= 2 ? 'neutral' : 'low');
+  }
 
   let debtScore;
   if (debtToEbitda == null) debtScore = 'unavailable';
