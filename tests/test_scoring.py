@@ -21,6 +21,7 @@ SCORE_KEYS = (
     "bookScore",
     "payoutScore",
     "overallRecommendation",
+    "sustainabilityWarning",
     "sectorProfile",
 )
 
@@ -298,6 +299,87 @@ CASES = [
         "sectorProfile": "reit",
         "bookScore": "buy",
     }, sector="Real Estate", industry="REIT - Residential", priceToBook=1.1),
+    _case("missing sustainability data does not warn", {
+        "overallRecommendation": "strong_buy",
+        "sustainabilityWarning": False,
+    }, sector="Communication Services", industry="Telecom Services",
+       fcfPayout=None, fcfDeficit=False, dividendCutRecent=False),
+    _case("FCF payout above 100 downgrades strong buy", {
+        "overallRecommendation": "buy",
+        "perScore": "buy",
+        "yieldScore": "buy",
+        "sustainabilityWarning": True,
+    }, sector="Communication Services", industry="Telecom Services", fcfPayout=100.01),
+    _case("FCF payout of exactly 100 does not warn", {
+        "overallRecommendation": "strong_buy",
+        "sustainabilityWarning": False,
+    }, sector="Communication Services", industry="Telecom Services", fcfPayout=100),
+    _case("negative free cash flow downgrades strong buy", {
+        "overallRecommendation": "buy",
+        "sustainabilityWarning": True,
+    }, sector="Communication Services", industry="Telecom Services", fcfPayout=None, fcfDeficit=True),
+    _case("a recent dividend cut downgrades strong buy", {
+        "overallRecommendation": "buy",
+        "sustainabilityWarning": True,
+    }, sector="Communication Services", industry="Telecom Services", dividendCutRecent=True),
+    _case("a cut and an uncovered payout still only step down to buy", {
+        "overallRecommendation": "buy",
+        "sustainabilityWarning": True,
+    }, sector="Communication Services", industry="Telecom Services", fcfPayout=140, dividendCutRecent=True),
+    _case("warning does not push a buy any lower", {
+        "overallRecommendation": "buy",
+        "yieldScore": "neutral",
+        "sustainabilityWarning": True,
+    }, sector="Communication Services", industry="Telecom Services", dividendYield=3, fcfPayout=150),
+    _case("warning does not change an overvalued label", {
+        "overallRecommendation": "avoid_overvalued",
+        "perScore": "expensive",
+        "sustainabilityWarning": True,
+    }, sector="Communication Services", industry="Telecom Services", per=25, fcfPayout=150),
+    _case("insurer ignores an uncovered FCF payout", {
+        "sectorProfile": "default",
+        "overallRecommendation": "strong_buy",
+        "sustainabilityWarning": False,
+    }, fcfPayout=180, fcfDeficit=True),
+    _case("insurance broker FCF payout above 100 downgrades strong buy", {
+        "sectorProfile": "default",
+        "overallRecommendation": "buy",
+        "sustainabilityWarning": True,
+    }, industry="Insurance Brokers", fcfPayout=140),
+    _case("bank ignores an uncovered FCF payout", {
+        "sectorProfile": "bank",
+        "perScore": "buy",
+        "yieldScore": "buy",
+        "overallRecommendation": "strong_buy",
+        "sustainabilityWarning": False,
+    }, sector="Financial Services", industry="Banks - Regional", per=9, dividendYield=5,
+       fcfPayout=250, fcfDeficit=True),
+    _case("bank dividend cut still downgrades strong buy", {
+        "sectorProfile": "bank",
+        "overallRecommendation": "buy",
+        "sustainabilityWarning": True,
+    }, sector="Financial Services", industry="Banks - Regional", per=9, dividendYield=5,
+       dividendCutRecent=True),
+    _case("REIT FFO payout above 100 warns and stays buy", {
+        "sectorProfile": "reit",
+        "perScore": "not_applicable",
+        "yieldScore": "buy",
+        "overallRecommendation": "buy",
+        "sustainabilityWarning": True,
+    }, sector="Real Estate", industry="REIT - Retail", dividendYield=6, fcfPayout=130),
+    _case("REIT covered FFO does not warn", {
+        "sectorProfile": "reit",
+        "overallRecommendation": "buy",
+        "sustainabilityWarning": False,
+    }, sector="Real Estate", industry="REIT - Residential", dividendYield=6, fcfPayout=70),
+    _case("a non-boolean cut flag does not warn", {
+        "overallRecommendation": "strong_buy",
+        "sustainabilityWarning": False,
+    }, sector="Communication Services", industry="Telecom Services", dividendCutRecent="yes"),
+    _case("a numeric payout string still warns", {
+        "overallRecommendation": "buy",
+        "sustainabilityWarning": True,
+    }, sector="Communication Services", industry="Telecom Services", fcfPayout="101"),
 ]
 
 
@@ -312,6 +394,9 @@ def _python_score(inp):
         payout_percent=inp.get("payoutRatio"),
         min_yield=inp.get("minYield", 4),
         max_per=inp.get("maxPer", 15),
+        fcf_payout=inp.get("fcfPayout"),
+        fcf_deficit=inp.get("fcfDeficit", False),
+        dividend_cut=inp.get("dividendCutRecent", False),
     )
     return {key: scored[key] for key in SCORE_KEYS}
 
@@ -374,6 +459,44 @@ process.stdout.write(JSON.stringify({ scores, fallbacks }));
             "minYield": 5,
             "maxPer": 15,
         },
+        {
+            "item": {
+                "symbol": "T",
+                "recommendation": "strong_buy",
+                "hasScoreInputs": True,
+                "sector": "Communication Services",
+                "industry": "Telecom Services",
+                "per": 12.4,
+                "divYield": 4.78,
+                "debtToEbitda": 3.93,
+                "priceToBook": 1.47,
+                "payoutRatio": 59.36,
+                "fcfPayout": 132,
+                "fcfDeficit": False,
+                "dividendCutRecent": False,
+            },
+            "minYield": 4,
+            "maxPer": 15,
+        },
+        {
+            "item": {
+                "symbol": "CS.PA",
+                "recommendation": "strong_buy",
+                "hasScoreInputs": True,
+                "sector": "Financial Services",
+                "industry": "Insurance - Diversified",
+                "per": 12.4,
+                "divYield": 5.06,
+                "debtToEbitda": 2.1,
+                "priceToBook": 2.08,
+                "payoutRatio": 62.5,
+                "fcfPayout": 180,
+                "fcfDeficit": True,
+                "dividendCutRecent": False,
+            },
+            "minYield": 4,
+            "maxPer": 15,
+        },
     ]
     proc = subprocess.run(
         ["node", "-e", script],
@@ -406,6 +529,10 @@ def test_python_and_javascript_agree():
     # The same metrics, once stored, follow the current thresholds.
     assert js_payload["fallbacks"][1] == "strong_buy"
     assert js_payload["fallbacks"][2] == "buy"
+    # Stored cash-payout and cut inputs move with the sliders, same as P/E.
+    assert js_payload["fallbacks"][3] == "buy"
+    # An insurer keeps Strong Buy: the stored FCF figure is not used.
+    assert js_payload["fallbacks"][4] == "strong_buy"
 
 
 def test_score_stock_includes_displayed_thresholds():

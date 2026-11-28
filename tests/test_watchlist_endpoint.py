@@ -51,6 +51,9 @@ SCORE_INPUT_KEYS = {
     "debtToEbitda",
     "priceToBook",
     "payoutRatio",
+    "fcfPayout",
+    "fcfDeficit",
+    "dividendCutRecent",
 }
 METRIC_KEYS = {
     "per",
@@ -60,6 +63,13 @@ METRIC_KEYS = {
     "payoutRatio",
     "priceToBook",
     "debtToEbitda",
+    "fcfPayout",
+    "fcfPayoutBasis",
+    "fcfDeficit",
+    "yearsDividendPaid",
+    "yearsDividendRaised",
+    "dividendCagr5y",
+    "dividendCutRecent",
 }
 ANALYZE_KEYS = WATCHLIST_KEYS | {
     "currentPrice",
@@ -85,6 +95,15 @@ def _dividends():
 
 
 DIVS = _dividends()
+
+
+def _cashflow_frame():
+    # Latest year: dividends 80 on free cash flow of 200, a 40% payout.
+    return pd.DataFrame(
+        [[200.0, 180.0], [-80.0, -70.0]],
+        index=["Free Cash Flow", "Common Stock Dividend Paid"],
+        columns=pd.to_datetime(["2024-12-31", "2023-12-31"]),
+    )
 
 
 class Recorder:
@@ -136,6 +155,11 @@ def _install(recorder, info, balance_sheet=None, financials=None):
             index = pd.to_datetime(["2026-01-05", "2026-01-12", "2026-01-19"])
             return pd.DataFrame({"Close": [39.0, 40.5, 41.25]}, index=index)
 
+        @property
+        def cashflow(self):
+            recorder.add("cashflow")
+            return _cashflow_frame()
+
     main.yf.Ticker = FakeTicker
     yahoo_cache.yf.Ticker = FakeTicker
 
@@ -181,10 +205,23 @@ def test_watchlist_shape_matches_scoring_and_skips_the_chart():
         assert row["metrics"]["trailingDividendYield"] == expected_summary["trailingDividendYield"]
         assert row["metrics"]["yieldComparison"] == expected_summary["yieldComparison"]
         assert row["dividendTrend"] == main.dividend_growth_trend(main._DividendSeries(DIVS))
+        history = main.dividend_history_metrics(DIVS)
+        assert row["metrics"]["fcfPayout"] == 40.0
+        assert row["metrics"]["fcfPayoutBasis"] == "fcf"
+        assert row["metrics"]["fcfDeficit"] is False
+        assert row["metrics"]["dividendCutRecent"] is False
+        assert row["metrics"]["yearsDividendPaid"] == history["yearsDividendPaid"]
+        assert row["metrics"]["yearsDividendRaised"] == history["yearsDividendRaised"]
+        assert row["metrics"]["dividendCagr5y"] == history["dividendCagr5y"]
+        assert row["scoringInputs"]["fcfPayout"] == 40.0
+        assert row["scoringInputs"]["fcfDeficit"] is False
+        assert row["scoringInputs"]["dividendCutRecent"] is False
+        assert row["scores"]["sustainabilityWarning"] is False
 
         called = recorder.names()
         assert "info" in called
         assert "dividends" in called
+        assert "cashflow" in called
         assert "calendar" not in called
         assert "balance_sheet" not in called
         assert "financials" not in called
@@ -312,6 +349,11 @@ def test_batch_streams_each_symbol_and_reports_a_miss():
             def history(self, **kwargs):
                 recorder.add("history")
                 raise AssertionError("batch watchlist must not download the price chart")
+
+            @property
+            def cashflow(self):
+                recorder.add("cashflow:" + self.symbol)
+                return _cashflow_frame()
 
             @property
             def calendar(self):

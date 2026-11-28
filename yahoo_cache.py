@@ -265,6 +265,20 @@ def cached_statements(symbol, fresh=False):
     return cached_load(key, STATEMENT_TTL_SECONDS, load, fresh=fresh)
 
 
+def cached_cashflow(symbol, fresh=False):
+    """Annual cash-flow statement. Same long TTL as the other statements.
+
+    The watchlist uses this for the free-cash-flow payout. A warm refresh
+    must not download it again.
+    """
+    key = ("cf", _symbol_key(symbol))
+
+    def load():
+        return yf.Ticker(symbol).cashflow
+
+    return cached_load(key, STATEMENT_TTL_SECONDS, load, fresh=fresh)
+
+
 def cached_price_history(symbol, fresh=False):
     """One year of weekly closes, in the shape the price chart already expects."""
     key = ("hist", _symbol_key(symbol))
