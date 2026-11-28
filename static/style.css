@@ -839,6 +839,25 @@ body.has-results .results-state { display: block; }
   font-size: 12px;
   color: var(--text-dim);
 }
+.wl-refresh-status {
+  margin: -8px 0 16px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--red);
+}
+.wl-refresh-status:empty { display: none; }
+.wl-rec-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 0 0 14px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.wl-rec-count strong {
+  color: var(--text);
+  font-weight: 600;
+}
 
 /* ===== Watchlist Filters ===== */
 .wl-filters {

@@ -14,6 +14,7 @@ let currentTrailingDivYield = null;
 let currentYieldComparison = null;
 let currentPer           = null;
 let currentDividendTrend = null;
+let currentAnalysis      = null;
 let currentView          = 'analyze';
 
 // ===== Config =====
@@ -144,12 +145,20 @@ const SECTOR_ORDER = [
 
 // ===== Settings =====
 
+function snapSetting(value, min, max, step, fallback) {
+  const n = parseFloat(value);
+  if (!Number.isFinite(n)) return fallback;
+  const clamped = Math.min(max, Math.max(min, n));
+  const steps = Math.round((clamped - min) / step);
+  return Math.round((min + steps * step) * 1000) / 1000;
+}
+
 function getMinYield() {
-  return parseFloat(localStorage.getItem('dlMinYield') || '4');
+  return snapSetting(localStorage.getItem('dlMinYield'), 2, 8, 0.5, 4);
 }
 
 function getMaxPer() {
-  return parseFloat(localStorage.getItem('dlMaxPer') || '15');
+  return snapSetting(localStorage.getItem('dlMaxPer'), 8, 25, 1, 15);
 }
 
 function getCurrencySymbol() {
@@ -179,6 +188,8 @@ function initSettings() {
 
   const minYield = getMinYield();
   const maxPer = getMaxPer();
+  localStorage.setItem('dlMinYield', String(minYield));
+  localStorage.setItem('dlMaxPer', String(maxPer));
   const yieldSlider = document.getElementById('yield-slider');
   const perSlider   = document.getElementById('per-slider');
   if (yieldSlider) {
@@ -229,25 +240,44 @@ function setCurrency(sym) {
 }
 
 function onYieldSlider(val) {
-  const v = parseFloat(val);
-  document.getElementById('yield-display').textContent = v.toFixed(1) + '%';
+  const v = snapSetting(val, 2, 8, 0.5, 4);
+  const display = document.getElementById('yield-display');
+  if (display) display.textContent = v.toFixed(1) + '%';
   localStorage.setItem('dlMinYield', String(v));
+  onThresholdsChanged();
 }
 
 function onPerSlider(val) {
-  const v = parseFloat(val);
-  document.getElementById('per-display').textContent = v + 'x';
+  const v = snapSetting(val, 8, 25, 1, 15);
+  const display = document.getElementById('per-display');
+  if (display) display.textContent = v + 'x';
   localStorage.setItem('dlMaxPer', String(v));
+  onThresholdsChanged();
 }
 
 function resetThresholds() {
   const yieldSlider = document.getElementById('yield-slider');
   const perSlider   = document.getElementById('per-slider');
-  if (yieldSlider) { yieldSlider.value = 4; document.getElementById('yield-display').textContent = '4.0%'; }
-  if (perSlider)   { perSlider.value   = 15; document.getElementById('per-display').textContent  = '15x'; }
+  if (yieldSlider) yieldSlider.value = 4;
+  if (perSlider)   perSlider.value   = 15;
   localStorage.setItem('dlMinYield', '4');
-  localStorage.setItem('dlMaxPer',   '15');
-  if (currentTicker) analyzeStock(currentTicker);
+  localStorage.setItem('dlMaxPer', '15');
+  const yieldDisplay = document.getElementById('yield-display');
+  const perDisplay   = document.getElementById('per-display');
+  if (yieldDisplay) yieldDisplay.textContent = '4.0%';
+  if (perDisplay)   perDisplay.textContent   = '15x';
+  onThresholdsChanged();
+}
+
+function onThresholdsChanged() {
+  if (currentAnalysis) {
+    const live = liveScores(currentAnalysis);
+    currentRec = live.overallRecommendation;
+    updateAnalysisScoreDom(live);
+  }
+  // Re-render the table in place. Skip while a note is being edited so the
+  // textarea is not thrown away mid-keystroke.
+  if (!document.querySelector('.note-textarea')) renderWatchlistTable();
 }
 
 
@@ -365,22 +395,33 @@ function isInWatchlist(symbol) {
   return getWatchlist().some(i => i.symbol === symbol);
 }
 
-function addToWatchlist(symbol, name, sector, industry, recommendation, divYield, per, dividendTrend, trailingDivYield, yieldComparison) {
+function addToWatchlist(symbol, name, sector, industry, recommendation, divYield, per, dividendTrend, scoreInputs) {
   const wl  = getWatchlist();
   const idx = wl.findIndex(i => i.symbol === symbol);
+  const prev = idx === -1 ? {} : wl[idx];
+  // Spread the previous row first so notes and any older fields survive.
+  // divYield is the forward yield used for the recommendation. The trailing
+  // 12-month yield and its comparison are stored beside it and are not scored.
   const entry = {
+    ...prev,
     symbol,
     name,
-    sector: sector || '',
-    industry: industry || '',
-    recommendation: recommendation || '',
-    divYield: divYield ?? null,
-    trailingDivYield: trailingDivYield ?? null,
-    yieldComparison: yieldComparison || null,
-    per: per ?? null,
-    dividendTrend: dividendTrend ?? null,
-    notes: idx !== -1 ? (wl[idx].notes || '') : '',
+    sector: sector || prev.sector || '',
+    industry: industry || prev.industry || '',
+    recommendation: recommendation || prev.recommendation || '',
+    divYield: divYield ?? prev.divYield ?? null,
+    per: per ?? prev.per ?? null,
+    dividendTrend: dividendTrend ?? prev.dividendTrend ?? null,
+    notes: prev.notes || '',
   };
+  if (scoreInputs && scoreInputs.hasScoreInputs) {
+    entry.debtToEbitda = scoreInputs.debtToEbitda ?? null;
+    entry.priceToBook = scoreInputs.priceToBook ?? null;
+    entry.payoutRatio = scoreInputs.payoutRatio ?? null;
+    entry.trailingDivYield = scoreInputs.trailingDivYield ?? null;
+    entry.yieldComparison = scoreInputs.yieldComparison || null;
+    entry.hasScoreInputs = true;
+  }
   if (idx === -1) wl.push(entry);
   else wl[idx] = entry;
   saveWatchlist(wl);
@@ -396,16 +437,61 @@ function removeFromWatchlist(symbol) {
   updateWlBadge();
 }
 
+function scoreInputsFromAnalysis(data) {
+  if (!data || (!data.scoringInputs && !data.metrics)) return null;
+  const s = data.scoringInputs || {};
+  const m = data.metrics || {};
+  const pick = key => (s[key] !== undefined ? s[key] : m[key]);
+  return {
+    per: pick('per') ?? null,
+    divYield: pick('dividendYield') ?? null,
+    debtToEbitda: pick('debtToEbitda') ?? null,
+    priceToBook: pick('priceToBook') ?? null,
+    payoutRatio: pick('payoutRatio') ?? null,
+    trailingDivYield: m.trailingDividendYield ?? null,
+    yieldComparison: m.yieldComparison || null,
+    hasScoreInputs: true,
+  };
+}
+
+function liveScores(data) {
+  const inputs = scoreInputsFromAnalysis(data) || {};
+  return scoreMetrics({
+    sector: (data.scoringInputs && data.scoringInputs.sector !== undefined)
+      ? data.scoringInputs.sector
+      : (data.sector || ''),
+    industry: (data.scoringInputs && data.scoringInputs.industry !== undefined)
+      ? data.scoringInputs.industry
+      : (data.industry || ''),
+    per: inputs.per,
+    dividendYield: inputs.divYield,
+    debtToEbitda: inputs.debtToEbitda,
+    priceToBook: inputs.priceToBook,
+    payoutRatio: inputs.payoutRatio,
+    minYield: getMinYield(),
+    maxPer: getMaxPer(),
+  });
+}
+
+function itemRecommendation(item) {
+  return recommendationForItem(item, getMinYield(), getMaxPer());
+}
+
 function toggleWatchlist() {
   if (!currentTicker) return;
-  isInWatchlist(currentTicker)
-    ? removeFromWatchlist(currentTicker)
-    : addToWatchlist(
-        currentTicker, currentName || currentTicker,
-        currentSector, currentIndustry, currentRec,
-        currentDivYield, currentPer, currentDividendTrend,
-        currentTrailingDivYield, currentYieldComparison,
-      );
+  if (isInWatchlist(currentTicker)) {
+    removeFromWatchlist(currentTicker);
+    return;
+  }
+  const inputs = scoreInputsFromAnalysis(currentAnalysis);
+  addToWatchlist(
+    currentTicker, currentName || currentTicker,
+    currentSector, currentIndustry, currentRec,
+    inputs ? inputs.divYield : currentDivYield,
+    inputs ? inputs.per : currentPer,
+    currentDividendTrend,
+    inputs,
+  );
 }
 
 function syncWlBtn() {
@@ -454,10 +540,14 @@ function renderWatchlistTable() {
   const sectorFilter = document.getElementById('wl-filter-sector')?.value || '';
   const recFilter    = document.getElementById('wl-filter-rec')?.value || '';
 
-  let filtered = wl.filter(item => {
+  const matched = wl.filter(item => {
     if (textFilter && !item.symbol.toLowerCase().includes(textFilter) && !(item.name || '').toLowerCase().includes(textFilter)) return false;
     if (sectorFilter && mapSector(item.sector, item.industry || '', item.symbol) !== sectorFilter) return false;
-    if (recFilter && item.recommendation !== recFilter) return false;
+    return true;
+  });
+
+  let filtered = matched.filter(item => {
+    if (recFilter && itemRecommendation(item) !== recFilter) return false;
     return true;
   });
 
@@ -465,7 +555,7 @@ function renderWatchlistTable() {
     filtered.sort((a, b) => {
       let av, bv;
       if (wlSort.col === 'ticker')  { av = a.symbol;         bv = b.symbol;         }
-      if (wlSort.col === 'rec')    { av = RECOMMENDATION_ORDER[a.recommendation] ?? 99; bv = RECOMMENDATION_ORDER[b.recommendation] ?? 99; }
+      if (wlSort.col === 'rec')    { av = RECOMMENDATION_ORDER[itemRecommendation(a)] ?? 99; bv = RECOMMENDATION_ORDER[itemRecommendation(b)] ?? 99; }
       if (wlSort.col === 'sector') { av = mapSector(a.sector, a.industry || '', a.symbol); bv = mapSector(b.sector, b.industry || '', b.symbol); }
       if (wlSort.col === 'yield')  { av = a.divYield ?? -1; bv = b.divYield ?? -1; }
       if (wlSort.col === 'trailingYield') { av = a.trailingDivYield ?? -1; bv = b.trailingDivYield ?? -1; }
@@ -476,8 +566,10 @@ function renderWatchlistTable() {
     });
   }
 
+  const countsHTML = matched.length ? recommendationCountsHTML(matched) : '';
+
   if (!filtered.length) {
-    container.innerHTML = '<p class="empty-state-view">No results for this filter.</p>';
+    container.innerHTML = countsHTML + '<p class="empty-state-view">No results for this filter.</p>';
     return;
   }
 
@@ -487,7 +579,7 @@ function renderWatchlistTable() {
   };
 
   const rows = filtered.map(item => {
-    const rb     = REC_BADGE_CFG[item.recommendation];
+    const rb     = REC_BADGE_CFG[itemRecommendation(item)];
     const sector = mapSector(item.sector, item.industry || '', item.symbol);
     const wt     = item.dividendTrend ? WL_TREND_CFG[item.dividendTrend] : null;
     return (
@@ -510,6 +602,7 @@ function renderWatchlistTable() {
   }).join('');
 
   container.innerHTML =
+    countsHTML +
     `<div class="table-wrap"><table class="data-table">` +
     `<thead><tr>` +
     `<th class="sortable" onclick="setWlSort('ticker')">Ticker ${si('ticker')}</th>` +
@@ -530,6 +623,20 @@ function renderWatchlistTable() {
     td.addEventListener('click', e => e.stopPropagation());
   });
   attachTooltipListeners();
+}
+
+function recommendationCountsHTML(items) {
+  const counts = {};
+  for (const key of Object.keys(RECOMMENDATION_ORDER)) counts[key] = 0;
+  for (const item of items) {
+    const rec = itemRecommendation(item);
+    if (rec in counts) counts[rec] += 1;
+  }
+  const parts = Object.keys(RECOMMENDATION_ORDER).map(key => {
+    const label = REC_BADGE_CFG[key]?.label || key;
+    return `<span class="wl-rec-count"><span class="wl-rec-count-label">${label}</span> <strong>${counts[key]}</strong></span>`;
+  }).join('');
+  return `<div class="wl-rec-counts" aria-label="Recommendation counts">${parts}</div>`;
 }
 
 function setWlSort(col) {
@@ -638,66 +745,97 @@ async function asyncPool(limit, items, fn) {
   return Promise.all(results);
 }
 
+function renderRefreshStatus(failed) {
+  const el = document.getElementById('wl-refresh-status');
+  if (!el) return;
+  if (!failed || !failed.length) {
+    el.textContent = '';
+    return;
+  }
+  const noun = failed.length === 1 ? 'ticker' : 'tickers';
+  el.textContent = `${failed.length} ${noun} failed to refresh (${failed.join(', ')}) — previous data kept.`;
+}
+
 async function refreshWatchlist() {
   const btn = document.getElementById('wl-refresh-btn');
-  if (btn) { btn.disabled = true; }
+  if (btn) btn.disabled = true;
+  renderRefreshStatus([]);
 
-  const wl       = getWatchlist();
-  const toRefresh = wl.filter(i => i.recommendation !== 'avoid_no_dividends');
-
-  if (!toRefresh.length) {
+  const wl = getWatchlist();
+  if (!wl.length) {
     if (btn) { btn.disabled = false; btn.textContent = '↻ Refresh'; }
     return;
   }
 
   let completed = 0;
-  const total   = wl.length;
-
+  const total = wl.length;
   const updateBtn = () => {
     if (btn) btn.textContent = `↻ Refreshing... (${completed}/${total})`;
   };
   updateBtn();
 
+  // Collect every result, then write the watchlist once. Writing each row
+  // as it returned raced with the others and could drop a successful update.
+  const updates = new Map();
+  const failed = [];
+
   const refreshOne = async (item) => {
     try {
-      const params = new URLSearchParams({ minYield: getMinYield(), maxPer: getMaxPer() });
-      const res    = await fetch(`/api/analyze/${encodeURIComponent(item.symbol)}?${params}`);
+      const params = new URLSearchParams({
+        min_yield: String(getMinYield()),
+        max_per: String(getMaxPer()),
+      });
+      const res = await fetch(`/api/analyze/${encodeURIComponent(item.symbol)}?${params}`);
       if (!res.ok) throw new Error('bad response');
       const data = await res.json();
-
-      const watchlist = getWatchlist();
-      const index = watchlist.findIndex(w => w.symbol === item.symbol);
-      if (index !== -1) {
-        watchlist[index] = {
-          ...watchlist[index],
-          recommendation: data.scores.overallRecommendation,
-          divYield:       data.metrics.dividendYield,
-          trailingDivYield: data.metrics.trailingDividendYield ?? null,
-          yieldComparison: data.metrics.yieldComparison || null,
-          per:            data.metrics.per,
-          dividendTrend:  data.dividendTrend,
-          sector:         data.sector   || watchlist[index].sector,
-          industry:       data.industry || watchlist[index].industry,
-        };
-        saveWatchlist(watchlist);
-        if (currentView === 'watchlist') renderWatchlistTable();
-      }
+      const inputs = scoreInputsFromAnalysis(data);
+      if (!inputs) throw new Error('bad payload');
+      const live = liveScores(data);
+      updates.set(item.symbol, {
+        name: data.companyName || item.name,
+        sector: data.sector || item.sector || '',
+        industry: data.industry || item.industry || '',
+        recommendation: live.overallRecommendation,
+        divYield: inputs.divYield,
+        trailingDivYield: inputs.trailingDivYield,
+        yieldComparison: inputs.yieldComparison,
+        per: inputs.per,
+        dividendTrend: data.dividendTrend,
+        debtToEbitda: inputs.debtToEbitda,
+        priceToBook: inputs.priceToBook,
+        payoutRatio: inputs.payoutRatio,
+        hasScoreInputs: true,
+      });
     } catch (_) {
-      // keep existing data for this item
+      failed.push(item.symbol);
     } finally {
       completed++;
       updateBtn();
     }
   };
 
-  await asyncPool(10, toRefresh, refreshOne);
-
-  const d   = new Date();
-  const now = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
-    + ', ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
-  saveWlTimestamp(now);
-  renderWlTimestamp();
-  if (btn) { btn.disabled = false; btn.textContent = '↻ Refresh'; }
+  try {
+    await asyncPool(10, wl, refreshOne);
+    if (updates.size) {
+      const watchlist = getWatchlist();
+      for (const item of watchlist) {
+        const upd = updates.get(item.symbol);
+        if (!upd) continue;
+        Object.assign(item, upd);
+      }
+      saveWatchlist(watchlist);
+      renderWatchlistTable();
+      const d = new Date();
+      const now = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+        + ', ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+      saveWlTimestamp(now);
+      renderWlTimestamp();
+    }
+    const failedOrdered = wl.filter(item => failed.includes(item.symbol)).map(item => item.symbol);
+    renderRefreshStatus(failedOrdered);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '↻ Refresh'; }
+  }
 }
 
 
@@ -811,10 +949,14 @@ function selectModalSugg(symbol, name, sector, industry) {
 
 async function analyzeStock(ticker) {
   currentTicker = ticker.toUpperCase();
+  currentAnalysis = null;
   enterResultsState();
   showLoading();
   try {
-    const params = new URLSearchParams({ minYield: getMinYield(), maxPer: getMaxPer() });
+    const params = new URLSearchParams({
+      min_yield: String(getMinYield()),
+      max_per: String(getMaxPer()),
+    });
     const res = await fetch(`/api/analyze/${encodeURIComponent(ticker)}?${params}`);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -822,10 +964,10 @@ async function analyzeStock(ticker) {
       return;
     }
     const data = await res.json();
+    currentAnalysis      = data;
     currentName          = data.companyName;
     currentSector        = data.sector;
     currentIndustry      = data.industry;
-    currentRec           = data.scores.overallRecommendation;
     currentDivYield      = data.metrics.dividendYield;
     currentTrailingDivYield = data.metrics.trailingDividendYield ?? null;
     currentYieldComparison = data.metrics.yieldComparison || null;
@@ -931,10 +1073,35 @@ function renderTrendBadge(trend) {
   return `<span class="score-badge trend-badge ${cfg.cls}">${cfg.icon} ${cfg.label}</span>`;
 }
 
+function updateAnalysisScoreDom(scores) {
+  const recEl = document.getElementById('analysis-rec');
+  if (!recEl || !scores) return;
+  const rec = REC_CFG[scores.overallRecommendation] || REC_CFG.insufficient_data;
+  recEl.className = 'rec-block ' + rec.cls;
+  const icon = recEl.querySelector('.rec-icon');
+  if (icon) icon.textContent = rec.icon;
+  const text = recEl.querySelector('.rec-text');
+  if (text) text.textContent = rec.text;
+  const summary = recEl.querySelector('.rec-summary');
+  if (summary) summary.textContent = buildRecSummary(scores);
+  const root = document.getElementById('results-content');
+  if (!root) return;
+  for (const key of ['perScore', 'yieldScore', 'debtScore', 'bookScore', 'payoutScore']) {
+    const badge = root.querySelector(`[data-score-key="${key}"]`);
+    if (!badge) continue;
+    const cfg = (SCORE_CFG[key] || {})[scores[key]] || { label: scores[key] || 'N/A', cls: 's-gray' };
+    badge.className = 'score-badge ' + cfg.cls;
+    badge.textContent = cfg.label;
+  }
+}
+
 function renderResults(data) {
+  const live = liveScores(data);
+  const scores = { ...(data.scores || {}), ...live, sectorNote: data.scores?.sectorNote };
+  currentRec = scores.overallRecommendation;
   const {
     companyName, ticker, currentPrice, currency, sector,
-    metrics, dividendInfo, priceHistory, scores, dividendTrend,
+    metrics, dividendInfo, priceHistory, dividendTrend,
   } = data;
 
   const priceStr  = currentPrice != null
@@ -966,7 +1133,7 @@ function renderResults(data) {
         `<span class="info-icon" data-tooltip="${esc(YIELD_FORWARD_TOOLTIP)}">ⓘ</span>` +
         `<div class="m-label">Forward Yield</div>` +
         `<div class="m-value${valCls}">${displayVal}</div>` +
-        `<span class="score-badge ${cfg.cls}">${cfg.label}</span>` +
+        `<span class="score-badge ${cfg.cls}" data-score-key="${scoreKey}">${cfg.label}</span>` +
         `</div>` +
         `<div class="mini-card">` +
         `<span class="info-icon" data-tooltip="${esc(YIELD_TRAILING_TOOLTIP)}">ⓘ</span>` +
@@ -990,7 +1157,7 @@ function renderResults(data) {
       `<span class="info-icon" data-tooltip="${esc(tooltip)}">ⓘ</span>` +
       `<div class="m-label">${label}</div>` +
       `<div class="m-value${valCls}">${displayVal}</div>` +
-      `<span class="score-badge ${cfg.cls}">${cfg.label}</span>` +
+      `<span class="score-badge ${cfg.cls}" data-score-key="${scoreKey}">${cfg.label}</span>` +
       `</div>`
     );
   }).join('');
@@ -1032,7 +1199,7 @@ function renderResults(data) {
     (dividendInfo.paysDividends ? '✓ Pays dividends' : '✗ No dividends') +
     `</div></div></div>` +
 
-    `<div class="rec-block ${rec.cls}">` +
+    `<div class="rec-block ${rec.cls}" id="analysis-rec">` +
     `<span class="rec-icon">${rec.icon}</span>` +
     `<div class="rec-main"><div class="rec-text">${rec.text}</div></div>` +
     `<div class="rec-summary">${esc(recSummary)}</div>` +
@@ -2115,7 +2282,8 @@ function exportWatchlistCSV() {
   const headers = ['Ticker', 'Company', 'Sector', 'Recommendation', 'Forward Yield (%)', 'Trailing 12M Yield (%)', 'PER', 'Dividend Trend', 'Notes'];
   const rows    = wl.map(item => {
     const sector = mapSector(item.sector, item.industry || '', item.symbol);
-    const rec    = REC_BADGE_CFG[item.recommendation]?.label || item.recommendation || '';
+    const recKey = itemRecommendation(item);
+    const rec    = REC_BADGE_CFG[recKey]?.label || recKey || '';
     const trend  = item.dividendTrend ? (TREND_CFG[item.dividendTrend]?.label || item.dividendTrend) : '';
     return [
       item.symbol,

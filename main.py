@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from typing import Optional
 import yfinance as yf
 import math
 import datetime
@@ -21,8 +22,8 @@ def safe_float(value):
 
 
 def get_sector_profile(sector: str, industry: str) -> str:
-    sec = sector.lower()
-    ind = industry.lower()
+    sec = (sector or "").lower()
+    ind = (industry or "").lower()
     if "real estate" in sec or "reit" in ind:
         return "reit"
     if any(k in ind for k in ["bank", "savings", "mortgage", "credit"]):
@@ -33,9 +34,65 @@ def get_sector_profile(sector: str, industry: str) -> str:
         return "oil"
     if "technology" in sec:
         return "tech"
-    if any(k in ind for k in ["conglomerate", "holding", "diversified"]):
+    # "Insurance - Diversified" is an operating insurer, not a holding company.
+    # Matching the bare word "diversified" made P/E not applicable and capped
+    # AXA (CS.PA) at BUY no matter how cheap it was.
+    if _is_holding_industry(ind):
         return "holding"
     return "default"
+
+
+def _is_holding_industry(ind: str) -> bool:
+    if "conglomerate" in ind or "holding" in ind:
+        return True
+    return ind.strip() in {
+        "diversified",
+        "diversified financials",
+        "diversified financial services",
+    }
+
+
+def resolved_per(info: dict):
+    per = safe_float(info.get("trailingPE"))
+    if per is None or per <= 0:
+        per = safe_float(info.get("forwardPE"))
+        if per is not None and per <= 0:
+            per = None
+    return per
+
+
+def dividend_yield_percent(info: dict):
+    """Forward yield as a percent (5.06 means 5.06%).
+
+    This is dividendRate / price, with the existing dividendYield fallback.
+    Recommendations use this figure. The trailing 12-month yield is
+    display-only.
+    """
+    dividend_rate = safe_float(info.get("dividendRate")) or safe_float(info.get("lastDividendValue"))
+    current_price = safe_float(info.get("currentPrice")) or safe_float(info.get("regularMarketPrice"))
+    if dividend_rate and current_price and current_price > 0:
+        return round((dividend_rate / current_price) * 100, 2)
+    _dy_raw = safe_float(info.get("dividendYield", None))
+    if _dy_raw is None or _dy_raw <= 0:
+        return None
+    if _dy_raw < 0.50:
+        return round(_dy_raw * 100, 2)
+    if _dy_raw > 30:
+        return None
+    return round(_dy_raw, 2)
+
+
+def resolve_score_thresholds(min_yield=None, max_per=None, minYield=None, maxPer=None):
+    """Accept the snake_case query names and the camelCase names the UI sends.
+
+    FastAPI binds parameter names exactly, so minYield used to be ignored and
+    every analysis was scored at the 4% / 15x defaults.
+    """
+    if min_yield is None:
+        min_yield = 4.0 if minYield is None else minYield
+    if max_per is None:
+        max_per = 15.0 if maxPer is None else maxPer
+    return float(min_yield), float(max_per)
 
 
 _SECTOR_NOTES = {
@@ -48,18 +105,33 @@ _SECTOR_NOTES = {
 }
 
 
-def score_stock(info: dict, debt_to_ebitda, min_yield: float = 4.0, max_per: float = 15.0) -> dict:
-    sector   = info.get("sector")   or ""
-    industry = info.get("industry") or ""
-    profile  = get_sector_profile(sector, industry)
+def score_metrics(
+    sector: str = "",
+    industry: str = "",
+    per=None,
+    dividend_yield=None,
+    debt_to_ebitda=None,
+    price_to_book=None,
+    payout_percent=None,
+    min_yield: float = 4.0,
+    max_per: float = 15.0,
+) -> dict:
+    """Score already-resolved metrics. payout_percent is on a 0–100 scale.
 
-    per = safe_float(info.get("trailingPE"))
-    if per is None or per <= 0:
-        per = safe_float(info.get("forwardPE"))
-        if per is not None and per <= 0:
-            per = None
+    The browser ports this function (static/scoring.js) so a watchlist row
+    can be re-labeled from stored metrics when the yield or P/E slider moves,
+    without calling Yahoo again.
+    """
+    profile = get_sector_profile(sector or "", industry or "")
 
-    # PER scoring
+    per = safe_float(per)
+    if per is not None and per <= 0:
+        per = None
+    dividend_yield = safe_float(dividend_yield)
+    debt_to_ebitda = safe_float(debt_to_ebitda)
+    price_to_book = safe_float(price_to_book)
+    payout_percent = safe_float(payout_percent)
+
     if profile in ("reit", "holding"):
         per_score = "not_applicable"
     elif per is None:
@@ -73,34 +145,16 @@ def score_stock(info: dict, debt_to_ebitda, min_yield: float = 4.0, max_per: flo
     else:
         per_score = "buy" if per < max_per else ("neutral" if per <= 20 else "expensive")
 
-    # Yield scoring uses the forward yield (dividendRate / price, with the
-    # existing dividendYield fallback). The trailing 12-month yield is
-    # display-only. REIT "buy" is y > 5; every other profile uses min_yield
-    # (default 4).
-    dividend_rate = safe_float(info.get("dividendRate")) or safe_float(info.get("lastDividendValue"))
-    current_price = safe_float(info.get("currentPrice")) or safe_float(info.get("regularMarketPrice"))
-    if dividend_rate and current_price and current_price > 0:
-        dividend_yield = round((dividend_rate / current_price) * 100, 2)
-    else:
-        _dy_raw = safe_float(info.get("dividendYield", None))
-        if _dy_raw is None or _dy_raw <= 0:
-            dividend_yield = None
-        elif _dy_raw < 0.50:
-            dividend_yield = round(_dy_raw * 100, 2)
-        elif _dy_raw > 30:
-            dividend_yield = None
-        else:
-            dividend_yield = round(_dy_raw, 2)
+    # dividend_yield is the forward yield. REIT "buy" is y > 5; every other
+    # profile uses min_yield (default 4). The trailing 12-month yield is
+    # display-only and does not change the recommendation.
     if dividend_yield is None:
         yield_score = "none"
+    elif profile == "reit":
+        yield_score = "buy" if dividend_yield > 5 else ("neutral" if dividend_yield >= 3 else "low")
     else:
-        y = dividend_yield
-        if profile == "reit":
-            yield_score = "buy" if y > 5 else ("neutral" if y >= 3 else "low")
-        else:
-            yield_score = "buy" if y > min_yield else ("neutral" if y >= 2 else "low")
+        yield_score = "buy" if dividend_yield > min_yield else ("neutral" if dividend_yield >= 2 else "low")
 
-    # Debt scoring
     if debt_to_ebitda is None:
         debt_score = "unavailable"
     elif profile == "utility":
@@ -108,35 +162,29 @@ def score_stock(info: dict, debt_to_ebitda, min_yield: float = 4.0, max_per: flo
     else:
         debt_score = "safe" if debt_to_ebitda < 3 else ("moderate" if debt_to_ebitda <= 4 else "high")
 
-    # Book scoring
-    ptb = safe_float(info.get("priceToBook"))
     if profile == "holding":
         book_score = "not_applicable"
-    elif ptb is None:
+    elif price_to_book is None:
         book_score = "unavailable"
     elif profile == "bank":
-        book_score = "buy" if ptb < 1 else ("fair" if ptb <= 1.5 else "expensive")
+        book_score = "buy" if price_to_book < 1 else ("fair" if price_to_book <= 1.5 else "expensive")
     elif profile == "reit":
-        book_score = "buy" if ptb < 1.2 else ("fair" if ptb <= 2 else "expensive")
+        book_score = "buy" if price_to_book < 1.2 else ("fair" if price_to_book <= 2 else "expensive")
     else:
-        book_score = "buy" if ptb < 1 else ("fair" if ptb <= 2 else "expensive")
+        book_score = "buy" if price_to_book < 1 else ("fair" if price_to_book <= 2 else "expensive")
 
-    # Payout scoring
-    payout = safe_float(info.get("payoutRatio"))
     if profile == "holding":
         payout_score = "not_applicable"
-    elif payout is None:
+    elif payout_percent is None:
         payout_score = "unavailable"
+    elif payout_percent < 40:
+        payout_score = "low"
+    elif payout_percent <= 60:
+        payout_score = "healthy"
+    elif payout_percent <= 80:
+        payout_score = "high"
     else:
-        p = payout * 100
-        if p < 40:
-            payout_score = "low"
-        elif p <= 60:
-            payout_score = "healthy"
-        elif p <= 80:
-            payout_score = "high"
-        else:
-            payout_score = "very_high"
+        payout_score = "very_high"
 
     all_scores = [per_score, yield_score, debt_score, book_score, payout_score]
     unavailable_count = sum(1 for s in all_scores if s == "unavailable")
@@ -164,6 +212,22 @@ def score_stock(info: dict, debt_to_ebitda, min_yield: float = 4.0, max_per: flo
         "sectorProfile":         profile,
         "sectorNote":            _SECTOR_NOTES.get(profile),
     }
+
+
+def score_stock(info: dict, debt_to_ebitda, min_yield: float = 4.0, max_per: float = 15.0) -> dict:
+    info = info or {}
+    payout = safe_float(info.get("payoutRatio"))
+    return score_metrics(
+        sector=info.get("sector") or "",
+        industry=info.get("industry") or "",
+        per=resolved_per(info),
+        dividend_yield=dividend_yield_percent(info),
+        debt_to_ebitda=debt_to_ebitda,
+        price_to_book=safe_float(info.get("priceToBook")),
+        payout_percent=None if payout is None else payout * 100,
+        min_yield=min_yield,
+        max_per=max_per,
+    )
 
 
 def dividend_growth_trend(stock) -> str:
@@ -276,7 +340,14 @@ async def search_tickers(q: str):
 
 
 @app.get("/api/analyze/{ticker}")
-async def analyze_ticker(ticker: str, min_yield: float = 4.0, max_per: float = 15.0):
+async def analyze_ticker(
+    ticker: str,
+    min_yield: Optional[float] = None,
+    max_per: Optional[float] = None,
+    minYield: Optional[float] = None,
+    maxPer: Optional[float] = None,
+):
+    min_yield, max_per = resolve_score_thresholds(min_yield, max_per, minYield, maxPer)
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -317,20 +388,7 @@ async def analyze_ticker(ticker: str, min_yield: float = 4.0, max_per: float = 1
             except Exception:
                 pass
 
-        dividend_rate = safe_float(info.get("dividendRate")) or safe_float(info.get("lastDividendValue"))
-        current_price_val = safe_float(info.get("currentPrice")) or safe_float(info.get("regularMarketPrice"))
-        if dividend_rate and current_price_val and current_price_val > 0:
-            dividend_yield = round((dividend_rate / current_price_val) * 100, 2)
-        else:
-            _dy_raw = safe_float(info.get("dividendYield", None))
-            if _dy_raw is None or _dy_raw <= 0:
-                dividend_yield = None
-            elif _dy_raw < 0.50:
-                dividend_yield = round(_dy_raw * 100, 2)
-            elif _dy_raw > 30:
-                dividend_yield = None
-            else:
-                dividend_yield = round(_dy_raw, 2)
+        dividend_yield = dividend_yield_percent(info)
         pays_dividends = dividend_yield is not None and dividend_yield > 0
 
         last_dividend_date = None
@@ -357,20 +415,26 @@ async def analyze_ticker(ticker: str, min_yield: float = 4.0, max_per: float = 1
         except Exception:
             pass
 
-        per_raw = safe_float(info.get("trailingPE"))
-        if per_raw is None or per_raw <= 0:
-            per_raw = safe_float(info.get("forwardPE"))
-            if per_raw is not None and per_raw <= 0:
-                per_raw = None
-
+        per_raw = resolved_per(info)
         payout = safe_float(info.get("payoutRatio"))
         ptb = safe_float(info.get("priceToBook"))
-        scores = score_stock(info, debt_to_ebitda, min_yield, max_per)
+        payout_percent = None if payout is None else payout * 100
+        scores = score_metrics(
+            sector=info.get("sector") or "",
+            industry=info.get("industry") or "",
+            per=per_raw,
+            dividend_yield=dividend_yield,
+            debt_to_ebitda=debt_to_ebitda,
+            price_to_book=ptb,
+            payout_percent=payout_percent,
+            min_yield=min_yield,
+            max_per=max_per,
+        )
         dividend_trend = dividend_growth_trend(stock)
         try:
             yield_summary = summarize_dividend_yields(
                 stock.dividends,
-                current_price_val,
+                price,
                 dividend_yield,
             )
         except Exception:
@@ -389,9 +453,20 @@ async def analyze_ticker(ticker: str, min_yield: float = 4.0, max_per: float = 1
                 "dividendYield": dividend_yield,
                 "trailingDividendYield": yield_summary["trailingDividendYield"],
                 "yieldComparison": yield_summary["yieldComparison"],
-                "payoutRatio": round(payout * 100, 2) if payout is not None else None,
+                "payoutRatio": round(payout_percent, 2) if payout_percent is not None else None,
                 "priceToBook": round(ptb, 2) if ptb is not None else None,
                 "debtToEbitda": round(debt_to_ebitda, 2) if debt_to_ebitda is not None else None,
+            },
+            # Exact inputs score_metrics used. The watchlist stores these so
+            # labels can be recomputed when the sliders move.
+            "scoringInputs": {
+                "sector": info.get("sector") or "",
+                "industry": info.get("industry") or "",
+                "per": per_raw,
+                "dividendYield": dividend_yield,
+                "debtToEbitda": debt_to_ebitda,
+                "priceToBook": ptb,
+                "payoutRatio": payout_percent,
             },
             "dividendInfo": {
                 "paysDividends": pays_dividends,
