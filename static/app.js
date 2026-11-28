@@ -446,6 +446,9 @@ function addToWatchlist(symbol, name, sector, industry, recommendation, divYield
     entry.payoutRatio = scoreInputs.payoutRatio ?? null;
     entry.trailingDivYield = scoreInputs.trailingDivYield ?? null;
     entry.yieldComparison = scoreInputs.yieldComparison || null;
+    entry.fcfPayout = scoreInputs.fcfPayout ?? null;
+    entry.fcfDeficit = scoreInputs.fcfDeficit === true;
+    entry.dividendCutRecent = scoreInputs.dividendCutRecent === true;
     entry.hasScoreInputs = true;
   }
   if (idx === -1) wl.push(entry);
@@ -474,6 +477,9 @@ function scoreInputsFromAnalysis(data) {
     debtToEbitda: pick('debtToEbitda') ?? null,
     priceToBook: pick('priceToBook') ?? null,
     payoutRatio: pick('payoutRatio') ?? null,
+    fcfPayout: pick('fcfPayout') ?? null,
+    fcfDeficit: pick('fcfDeficit') === true,
+    dividendCutRecent: pick('dividendCutRecent') === true,
     trailingDivYield: m.trailingDividendYield ?? null,
     yieldComparison: m.yieldComparison || null,
     hasScoreInputs: true,
@@ -494,6 +500,9 @@ function liveScores(data) {
     debtToEbitda: inputs.debtToEbitda,
     priceToBook: inputs.priceToBook,
     payoutRatio: inputs.payoutRatio,
+    fcfPayout: inputs.fcfPayout,
+    fcfDeficit: inputs.fcfDeficit,
+    dividendCutRecent: inputs.dividendCutRecent,
     minYield: getMinYield(),
     maxPer: getMaxPer(),
   });
@@ -613,7 +622,7 @@ function renderWatchlistTable() {
       `<td><span class="wl-ticker">${esc(item.symbol)}</span></td>` +
       `<td class="td-company">${esc(item.name || '')}</td>` +
       `<td>${esc(sector)}</td>` +
-      `<td>${rb ? `<span class="rec-pill ${rb.cls}">${rb.label}</span>` : '—'}</td>` +
+      `<td>${rb ? `<span class="rec-pill ${rb.cls}">${rb.label}</span>` : '—'}${watchlistWarningHTML(item)}</td>` +
       `<td>${formatYieldPct(item.divYield)}</td>` +
       `<td>${formatYieldPct(item.trailingDivYield)}${yieldGapHTML(item.yieldComparison)}</td>` +
       `<td>${item.per != null ? item.per.toFixed(1) + 'x' : '—'}</td>` +
@@ -806,6 +815,9 @@ function applyWatchlistRefresh(symbol, data) {
     debtToEbitda: inputs.debtToEbitda,
     priceToBook: inputs.priceToBook,
     payoutRatio: inputs.payoutRatio,
+    fcfPayout: inputs.fcfPayout,
+    fcfDeficit: inputs.fcfDeficit,
+    dividendCutRecent: inputs.dividendCutRecent,
     hasScoreInputs: true,
   });
   saveWatchlist(watchlist);
@@ -1119,12 +1131,150 @@ function buildRecSummary(scores) {
   if (perMap[scores.perScore])     parts.push(perMap[scores.perScore]);
   if (yieldMap[scores.yieldScore]) parts.push(yieldMap[scores.yieldScore]);
   if (debtMap[scores.debtScore])   parts.push(debtMap[scores.debtScore]);
+  if (scores.sustainabilityWarning) parts.push('Dividend warning');
   return parts.join('  ·  ') || '—';
 }
 
 function formatYieldPct(value) {
   if (value == null || Number.isNaN(Number(value))) return '—';
   return Number(value).toFixed(2) + '%';
+}
+
+const FCF_PAYOUT_TOOLTIP = 'Free-cash-flow payout is the dividends paid divided by free cash flow, from the latest annual cash-flow statement. Above 100% means the dividend is larger than the cash the business generated, and a Strong Buy is held at Buy. Exactly 100% is still covered. n/a means those figures were missing, and a missing figure does not change the recommendation.';
+const FFO_PAYOUT_TOOLTIP = 'REITs are judged on funds from operations, estimated as net income plus depreciation and amortization, instead of free cash flow. Property purchases make free cash flow a poor measure of a REIT. Above 100% means the dividend is larger than that estimate, and a Strong Buy is held at Buy. n/a means the statement did not have the figures, and that does not change the recommendation.';
+const FCF_SKIPPED_TOOLTIP = 'Free-cash-flow payout is not a meaningful dividend check for banks and insurers, so it is not calculated and it does not change the recommendation. A dividend cut can still be a warning.';
+const YEARS_PAID_TOOLTIP = 'Consecutive years the company paid a dividend, counting back from the last complete year. The current year is left out because it is not finished. A year with no payment breaks the streak, unless the ex-date only slipped across New Year and the gap is still one normal interval. A special dividend still counts as paid.';
+const YEARS_RAISED_TOOLTIP = 'Consecutive years the regular dividend increased, ending with the last complete year. Each year is one full cycle of regular payments as of 31 December (the last 12 for a monthly payer, the last 4 for a quarterly payer), not the raw sum of that calendar year. A payment that slips from December into January does not look like a cut. A one-off or supplemental dividend is left out. A change of 1% or less counts as flat. Amounts are split-adjusted. The current year is left out.';
+const CAGR_TOOLTIP = 'Compound annual growth of the regular dividend from five years ago to the last complete year. Each year is one full cycle of regular payments, so a change in how many ex-dates fell in the calendar year does not move the figure. Special dividends are left out, and the current year is left out. n/a when either year is missing or the starting dividend is zero. This figure does not by itself change the recommendation.';
+
+function formatSustainYears(value) {
+  if (value == null || value === '') return 'n/a';
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 'n/a';
+  return String(Math.trunc(n));
+}
+
+function formatSustainPercent(value, digits) {
+  if (value == null || value === '') return 'n/a';
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 'n/a';
+  return n.toFixed(digits) + '%';
+}
+
+function formatCagr(value) {
+  if (value == null || value === '') return 'n/a';
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 'n/a';
+  const sign = n > 0 ? '+' : '';
+  return sign + n.toFixed(2) + '%';
+}
+
+function sustainabilityInput(data) {
+  const s = (data && data.scoringInputs) || {};
+  const m = (data && data.metrics) || {};
+  const pick = key => (s[key] !== undefined ? s[key] : m[key]);
+  return {
+    sector: s.sector !== undefined ? s.sector : ((data && data.sector) || ''),
+    industry: s.industry !== undefined ? s.industry : ((data && data.industry) || ''),
+    fcfPayout: pick('fcfPayout'),
+    fcfDeficit: pick('fcfDeficit') === true,
+    dividendCutRecent: pick('dividendCutRecent') === true,
+  };
+}
+
+function sustainabilityWarningText(facts) {
+  const parts = [];
+  if (facts.fcfDeficit) {
+    parts.push(facts.basis === 'ffo'
+      ? 'Dividends were paid while funds from operations were negative.'
+      : 'Dividends were paid while free cash flow was negative.');
+  } else if (facts.fcfHigh) {
+    const name = facts.basis === 'ffo' ? 'FFO payout' : 'FCF payout';
+    const shown = facts.fcfPayout == null ? '' : ' (' + Number(facts.fcfPayout).toFixed(0) + '%)';
+    parts.push(name + shown + ' is above 100%, so the dividend is not covered by cash.');
+  }
+  if (facts.dividendCut) {
+    parts.push('The regular dividend was cut in the last 5 complete years.');
+  }
+  return parts.join(' ');
+}
+
+function watchlistWarningHTML(item) {
+  if (!item || item.hasScoreInputs !== true) return '';
+  const facts = sustainabilityFacts({
+    sector: item.sector,
+    industry: item.industry,
+    fcfPayout: item.fcfPayout,
+    fcfDeficit: item.fcfDeficit,
+    dividendCutRecent: item.dividendCutRecent,
+  });
+  if (!facts.warning) return '';
+  const text = sustainabilityWarningText(facts) || 'Dividend sustainability warning.';
+  return `<span class="wl-warn-badge" data-tooltip="${esc(text)}" onclick="event.stopPropagation()" aria-label="Dividend sustainability warning">⚠</span>`;
+}
+
+function fcfPayoutCard(metrics) {
+  const basis = metrics && metrics.fcfPayoutBasis;
+  const label = basis === 'ffo' ? 'FFO Payout' : 'FCF Payout';
+  let tooltip = FCF_PAYOUT_TOOLTIP;
+  if (basis === 'ffo') tooltip = FFO_PAYOUT_TOOLTIP;
+  if (basis === 'skipped') tooltip = FCF_SKIPPED_TOOLTIP;
+  let value = 'n/a';
+  let badge = { label: 'n/a', cls: 's-gray' };
+  if (basis !== 'skipped' && metrics && metrics.fcfDeficit) {
+    value = 'Neg.';
+    badge = { label: 'Warning', cls: 's-red' };
+  } else if (basis !== 'skipped' && metrics && metrics.fcfPayout != null) {
+    value = formatSustainPercent(metrics.fcfPayout, 1);
+    if (metrics.fcfPayout > 100) badge = { label: 'Warning', cls: 's-red' };
+    else if (metrics.fcfPayout > 80) badge = { label: 'High', cls: 's-yellow' };
+    else badge = { label: 'Covered', cls: 's-green' };
+  }
+  return { label, value, tooltip, badge };
+}
+
+function yearsBadge(value, emptyLabel, filledLabel) {
+  if (value == null) return { label: 'n/a', cls: 's-gray' };
+  if (Number(value) > 0) return { label: filledLabel, cls: 's-green' };
+  return { label: emptyLabel, cls: 's-yellow' };
+}
+
+function cagrBadge(value) {
+  if (value == null || !Number.isFinite(Number(value))) return { label: 'n/a', cls: 's-gray' };
+  const n = Number(value);
+  if (n > 0) return { label: 'Growing', cls: 's-green' };
+  if (n < 0) return { label: 'Shrinking', cls: 's-red' };
+  return { label: 'Flat', cls: 's-yellow' };
+}
+
+function sustainabilityCardHTML(label, value, tooltip, badge) {
+  const na = value === 'n/a';
+  return (
+    `<div class="metric-card">` +
+    `<span class="info-icon" data-tooltip="${esc(tooltip)}">ⓘ</span>` +
+    `<div class="m-label">${esc(label)}</div>` +
+    `<div class="m-value${na ? ' na' : ''}">${esc(value)}</div>` +
+    `<span class="score-badge ${badge.cls}">${esc(badge.label)}</span>` +
+    `</div>`
+  );
+}
+
+function sustainabilitySectionHTML(metrics) {
+  const source = metrics || {};
+  const payout = fcfPayoutCard(source);
+  const paid = yearsBadge(source.yearsDividendPaid, 'None', 'Paid');
+  const raised = yearsBadge(source.yearsDividendRaised, 'Flat', 'Raised');
+  const cagr = cagrBadge(source.dividendCagr5y);
+  return (
+    `<div class="sustain-block">` +
+    `<div class="sustain-heading">Dividend sustainability</div>` +
+    `<div class="metrics-grid sustainability-grid">` +
+    sustainabilityCardHTML(payout.label, payout.value, payout.tooltip, payout.badge) +
+    sustainabilityCardHTML('Years Paid', formatSustainYears(source.yearsDividendPaid), YEARS_PAID_TOOLTIP, paid) +
+    sustainabilityCardHTML('Years Raised', formatSustainYears(source.yearsDividendRaised), YEARS_RAISED_TOOLTIP, raised) +
+    sustainabilityCardHTML('5Y Div. CAGR', formatCagr(source.dividendCagr5y), CAGR_TOOLTIP, cagr) +
+    `</div></div>`
+  );
 }
 
 function yieldTipIcon(text) {
@@ -1259,6 +1409,10 @@ function renderResults(data) {
 
   const rec          = REC_CFG[scores.overallRecommendation] || REC_CFG.insufficient_data;
   const recSummary   = buildRecSummary(scores);
+  const sustainFacts = sustainabilityFacts(sustainabilityInput(data));
+  const sustainLine  = sustainFacts.warning
+    ? `<div class="sustain-warn-line">⚠ ${esc(sustainabilityWarningText(sustainFacts))}</div>`
+    : '';
   const inList       = isInWatchlist(ticker);
   const sectorNote   = scores.sectorNote;
   const sectorBanner = sectorNote
@@ -1300,10 +1454,12 @@ function renderResults(data) {
     `<div class="rec-summary">${esc(recSummary)}</div>` +
     `</div>` +
 
+    sustainLine +
     sectorBanner +
     noteHTML +
 
     `<div class="metrics-grid">${metricsHTML}</div>` +
+    sustainabilitySectionHTML(metrics) +
 
     `<div class="chart-card">` +
     `<div class="chart-title">12-Month Price History</div>` +
@@ -2374,12 +2530,19 @@ function exportWatchlistCSV() {
   const wl = getWatchlist();
   if (!wl.length) return;
   const today   = new Date().toISOString().split('T')[0];
-  const headers = ['Ticker', 'Company', 'Sector', 'Recommendation', 'Forward Yield (%)', 'Trailing 12M Yield (%)', 'PER', 'Dividend Trend', 'Notes'];
+  const headers = ['Ticker', 'Company', 'Sector', 'Recommendation', 'Forward Yield (%)', 'Trailing 12M Yield (%)', 'PER', 'Dividend Trend', 'Sustainability', 'Notes'];
   const rows    = wl.map(item => {
     const sector = mapSector(item.sector, item.industry || '', item.symbol);
     const recKey = itemRecommendation(item);
     const rec    = REC_BADGE_CFG[recKey]?.label || recKey || '';
     const trend  = item.dividendTrend ? (TREND_CFG[item.dividendTrend]?.label || item.dividendTrend) : '';
+    const facts  = item.hasScoreInputs === true ? sustainabilityFacts({
+      sector: item.sector,
+      industry: item.industry,
+      fcfPayout: item.fcfPayout,
+      fcfDeficit: item.fcfDeficit,
+      dividendCutRecent: item.dividendCutRecent,
+    }) : null;
     return [
       item.symbol,
       item.name || '',
@@ -2389,6 +2552,7 @@ function exportWatchlistCSV() {
       item.trailingDivYield != null ? item.trailingDivYield.toFixed(2) : '',
       item.per      != null ? item.per.toFixed(1)      : '',
       trend,
+      facts && facts.warning ? 'Warning' : '',
       item.notes || '',
     ];
   });
@@ -2441,7 +2605,7 @@ globalTooltip.id = 'global-tooltip';
 document.body.appendChild(globalTooltip);
 
 function attachTooltipListeners() {
-  document.querySelectorAll('.info-icon').forEach(icon => {
+  document.querySelectorAll('.info-icon, .wl-warn-badge').forEach(icon => {
     if (icon.dataset.tipBound === '1') return;
     icon.dataset.tipBound = '1';
     icon.addEventListener('mouseenter', () => {

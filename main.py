@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Optional
 import asyncio
+import threading
 import yfinance as yf
 import math
 import datetime
@@ -14,6 +15,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from yahoo_cache import (
     YAHOO_CONCURRENCY,
+    cached_cashflow,
     cached_dividend_date,
     cached_dividends,
     cached_info,
@@ -129,6 +131,58 @@ def resolve_score_thresholds(min_yield=None, max_per=None, minYield=None, maxPer
     return float(min_yield), float(max_per)
 
 
+# A cash payout above this percent warns. Exactly 100% is still covered.
+FCF_PAYOUT_WARNING_PERCENT = 100.0
+
+
+def _is_operating_insurer(industry: str) -> bool:
+    """True for insurers whose cash flow is not a dividend-cover measure.
+
+    Insurance brokers are left out: they run an operating business, so
+    free cash flow still means something.
+    """
+    ind = (industry or "").lower()
+    return "insurance" in ind and "broker" not in ind
+
+
+def cash_payout_basis(sector: str, industry: str) -> str:
+    """Which cash payout, if any, is meaningful for this company.
+
+    "ffo" for REITs, "skipped" for banks and insurers, "fcf" otherwise.
+    The bank profile already covers banks, savings, mortgage lenders and
+    credit, matching get_sector_profile. Skipped ratios are not a warning.
+    """
+    profile = get_sector_profile(sector or "", industry or "")
+    if profile == "bank":
+        return "skipped"
+    if profile == "reit":
+        return "ffo"
+    if _is_operating_insurer(industry):
+        return "skipped"
+    return "fcf"
+
+
+def _flag(value) -> bool:
+    """True only for a real boolean True. Missing and other types do not warn."""
+    return value is True
+
+
+def sustainability_warning(sector, industry, fcf_payout, fcf_deficit, dividend_cut) -> bool:
+    """True when the dividend looks uncovered or was cut in recent years.
+
+    Missing figures never warn. Banks and insurers ignore the cash payout.
+    A payout of exactly 100% does not warn.
+    """
+    if _flag(dividend_cut):
+        return True
+    if cash_payout_basis(sector, industry) == "skipped":
+        return False
+    if _flag(fcf_deficit):
+        return True
+    payout = safe_float(fcf_payout)
+    return payout is not None and payout > FCF_PAYOUT_WARNING_PERCENT
+
+
 _SECTOR_NOTES = {
     "reit":    "REITs distribute most earnings as dividends. P/E ratio is not meaningful — focus on yield and P/B instead.",
     "bank":    "For banks, Price/Book is more meaningful than P/E. A P/B below 1 means you're buying assets at a discount.",
@@ -149,12 +203,21 @@ def score_metrics(
     payout_percent=None,
     min_yield: float = 4.0,
     max_per: float = 15.0,
+    fcf_payout=None,
+    fcf_deficit=False,
+    dividend_cut=False,
 ) -> dict:
     """Score already-resolved metrics. payout_percent is on a 0–100 scale.
 
     The browser ports this function (static/scoring.js) so a watchlist row
     can be re-labeled from stored metrics when the yield or P/E slider moves,
     without calling Yahoo again.
+
+    fcf_payout is dividends / free cash flow (or FFO for a REIT) as a
+    percent. fcf_deficit means dividends were paid while that cash figure
+    was not positive. dividend_cut means the regular dividend fell in the
+    last five complete years. Either warning downgrades a Strong Buy to
+    Buy and does nothing to any other label. Missing values do not warn.
     """
     profile = get_sector_profile(sector or "", industry or "")
 
@@ -244,6 +307,10 @@ def score_metrics(
     else:
         overall = "neutral"
 
+    warning = sustainability_warning(sector, industry, fcf_payout, fcf_deficit, dividend_cut)
+    if overall == "strong_buy" and warning:
+        overall = "buy"
+
     return {
         "perScore":              per_score,
         "yieldScore":            yield_score,
@@ -251,12 +318,21 @@ def score_metrics(
         "bookScore":             book_score,
         "payoutScore":           payout_score,
         "overallRecommendation": overall,
+        "sustainabilityWarning": warning,
         "sectorProfile":         profile,
         "sectorNote":            _SECTOR_NOTES.get(profile),
     }
 
 
-def score_stock(info: dict, debt_to_ebitda, min_yield: float = 4.0, max_per: float = 15.0) -> dict:
+def score_stock(
+    info: dict,
+    debt_to_ebitda,
+    min_yield: float = 4.0,
+    max_per: float = 15.0,
+    fcf_payout=None,
+    fcf_deficit=False,
+    dividend_cut=False,
+) -> dict:
     info = info or {}
     payout = safe_float(info.get("payoutRatio"))
     return score_metrics(
@@ -269,24 +345,30 @@ def score_stock(info: dict, debt_to_ebitda, min_yield: float = 4.0, max_per: flo
         payout_percent=None if payout is None else payout * 100,
         min_yield=min_yield,
         max_per=max_per,
+        fcf_payout=fcf_payout,
+        fcf_deficit=fcf_deficit,
+        dividend_cut=dividend_cut,
     )
 
 
 def dividend_growth_trend(stock) -> str:
     try:
-        divs = stock.dividends
-        if divs is None or len(divs) == 0:
+        divs = getattr(stock, "dividends", None)
+        if divs is None:
+            return "insufficient_data"
+        try:
+            if len(divs) == 0:
+                return "insufficient_data"
+        except TypeError:
             return "insufficient_data"
 
-        current_year = datetime.datetime.now().year
-        # Group by year using lambda to avoid timezone issues; exclude current partial year
-        annual = divs.groupby(lambda ts: ts.year).sum()
-        annual = annual[(annual.index >= current_year - 5) & (annual.index < current_year)]
-
-        if len(annual) < 2:
+        as_of = datetime.date.today()
+        rates = _rates_by_year(divs, as_of)
+        latest = as_of.year - 1
+        values = [rates[year] for year in range(latest - 4, latest + 1) if year in rates]
+        if len(values) < 2:
             return "insufficient_data"
-
-        values = annual.tail(3).tolist()
+        values = values[-3:]
 
         if all(values[i] < values[i + 1] for i in range(len(values) - 1)):
             return "growing"
@@ -417,6 +499,53 @@ def _debt_to_ebitda(info, symbol, fresh):
     return None
 
 
+def _run_side_by_side(jobs):
+    """Run callables on threads and return their values. A failure is None.
+
+    One job stays on this thread. The cache and the Yahoo semaphore are
+    already safe to share across threads.
+    """
+    if len(jobs) <= 1:
+        out = {"dividends": None, "cashflow": None}
+        if jobs:
+            name, fn = jobs[0]
+            try:
+                out[name] = fn()
+            except Exception:
+                out[name] = None
+        return out
+
+    boxes = {}
+    threads = []
+    for name, fn in jobs:
+        box = {}
+        boxes[name] = box
+
+        def run(fn=fn, box=box):
+            try:
+                box["value"] = fn()
+            except Exception:
+                box["error"] = True
+
+        thread = threading.Thread(target=run)
+        threads.append(thread)
+        thread.start()
+    for thread in threads:
+        thread.join()
+    out = {"dividends": None, "cashflow": None}
+    for name, box in boxes.items():
+        out[name] = None if box.get("error") else box.get("value")
+    return out
+
+
+def _load_dividend_inputs(symbol, fresh, fetch_cashflow):
+    """Dividend history, plus the cash-flow statement when the sector uses it."""
+    jobs = [("dividends", lambda: cached_dividends(symbol, fresh=fresh))]
+    if fetch_cashflow:
+        jobs.append(("cashflow", lambda: cached_cashflow(symbol, fresh=fresh)))
+    return _run_side_by_side(jobs)
+
+
 def _build_analysis(ticker: str, min_yield: float, max_per: float, fresh: bool = False, include_history: bool = True):
     """Shared scoring path for /api/analyze and the watchlist.
 
@@ -456,6 +585,16 @@ def _build_analysis(ticker: str, min_yield: float, max_per: float, fresh: bool =
         payout_percent = None if payout is None else payout * 100
         sector = info.get("sector") or ""
         industry = info.get("industry") or ""
+        # Dividends and the cash-flow statement are independent. Fetching
+        # them together keeps the extra statement off the critical path.
+        # Banks and insurers skip the statement entirely.
+        basis = cash_payout_basis(sector, industry)
+        loaded = _load_dividend_inputs(symbol, fresh, fetch_cashflow=basis != "skipped")
+        divs = loaded.get("dividends")
+        try:
+            sustainability = assemble_sustainability(sector, industry, divs, loaded.get("cashflow"))
+        except Exception:
+            sustainability = empty_sustainability()
         scores = score_metrics(
             sector=sector,
             industry=industry,
@@ -466,11 +605,10 @@ def _build_analysis(ticker: str, min_yield: float, max_per: float, fresh: bool =
             payout_percent=payout_percent,
             min_yield=min_yield,
             max_per=max_per,
+            fcf_payout=sustainability["fcfPayout"],
+            fcf_deficit=sustainability["fcfDeficit"],
+            dividend_cut=sustainability["dividendCutRecent"],
         )
-        try:
-            divs = cached_dividends(symbol, fresh=fresh)
-        except Exception:
-            divs = None
         dividend_trend = dividend_growth_trend(_DividendSeries(divs))
         try:
             yield_summary = summarize_dividend_yields(divs, price, dividend_yield)
@@ -493,9 +631,18 @@ def _build_analysis(ticker: str, min_yield: float, max_per: float, fresh: bool =
                 "payoutRatio": round(payout_percent, 2) if payout_percent is not None else None,
                 "priceToBook": round(ptb, 2) if ptb is not None else None,
                 "debtToEbitda": round(debt_to_ebitda, 2) if debt_to_ebitda is not None else None,
+                "fcfPayout": sustainability["fcfPayout"],
+                "fcfPayoutBasis": sustainability["fcfPayoutBasis"],
+                "fcfDeficit": sustainability["fcfDeficit"],
+                "yearsDividendPaid": sustainability["yearsDividendPaid"],
+                "yearsDividendRaised": sustainability["yearsDividendRaised"],
+                "dividendCagr5y": sustainability["dividendCagr5y"],
+                "dividendCutRecent": sustainability["dividendCutRecent"],
             },
             # Exact inputs score_metrics used. The watchlist stores these so
-            # labels can be recomputed when the sliders move.
+            # labels can be recomputed when the sliders move. The cash payout
+            # and the cut flag are part of that, or a refresh would forget
+            # the sustainability warning the moment a slider moves.
             "scoringInputs": {
                 "sector": info.get("sector") or "",
                 "industry": info.get("industry") or "",
@@ -504,6 +651,9 @@ def _build_analysis(ticker: str, min_yield: float, max_per: float, fresh: bool =
                 "debtToEbitda": debt_to_ebitda,
                 "priceToBook": ptb,
                 "payoutRatio": payout_percent,
+                "fcfPayout": sustainability["fcfPayout"],
+                "fcfDeficit": sustainability["fcfDeficit"],
+                "dividendCutRecent": sustainability["dividendCutRecent"],
             },
             "dividendInfo": {
                 "paysDividends": pays_dividends,
@@ -915,6 +1065,568 @@ def possible_special_dividend(payments) -> bool:
     if baseline <= 0:
         return False
     return largest >= SPECIAL_DIVIDEND_MULTIPLE * baseline
+
+
+# A year-over-year change inside this band is flat. Split-adjusted
+# dividends often differ by rounding, and that must not look like a cut
+# or a raise. Exactly 1% is still flat.
+DIVIDEND_FLAT_BAND = 0.01
+# How many complete years back a cut still warns.
+RECENT_DIVIDEND_CUT_YEARS = 5
+DIVIDEND_CAGR_YEARS = 5
+
+_DIVIDEND_PAID_LABELS = (
+    "Common Stock Dividend Paid",
+    "Cash Dividends Paid",
+    "Common Stock Dividends Paid",
+    "Dividends Paid",
+)
+_FCF_LABELS = ("Free Cash Flow",)
+_OPERATING_CASH_LABELS = (
+    "Operating Cash Flow",
+    "Cash Flow From Continuing Operating Activities",
+    "Total Cash From Operating Activities",
+)
+_CAPEX_LABELS = (
+    "Capital Expenditure",
+    "Capital Expenditure Reported",
+    "Purchase Of PPE",
+)
+_NET_INCOME_LABELS = (
+    "Net Income From Continuing Operations",
+    "Net Income",
+    "Net Income Common Stockholders",
+)
+_DEPRECIATION_LABELS = (
+    "Depreciation And Amortization",
+    "Depreciation Amortization Depletion",
+    "Depreciation",
+)
+
+
+def empty_sustainability():
+    return {
+        "fcfPayout": None,
+        "fcfPayoutBasis": None,
+        "fcfDeficit": False,
+        "yearsDividendPaid": None,
+        "yearsDividendRaised": None,
+        "dividendCagr5y": None,
+        "dividendCutRecent": False,
+    }
+
+
+def _column_time(column):
+    if hasattr(column, "to_pydatetime"):
+        try:
+            value = column.to_pydatetime()
+            return value.replace(tzinfo=None)
+        except Exception:
+            pass
+    if isinstance(column, datetime.datetime):
+        return column.replace(tzinfo=None)
+    if isinstance(column, datetime.date):
+        return datetime.datetime.combine(column, datetime.time.min)
+    try:
+        return datetime.datetime.strptime(str(column)[:10], "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return datetime.datetime.min
+
+
+def _statement_columns(frame):
+    try:
+        columns = list(frame.columns)
+    except Exception:
+        return []
+    return sorted(columns, key=_column_time, reverse=True)
+
+
+def _statement_value(frame, labels, column):
+    if frame is None or getattr(frame, "empty", True):
+        return None
+    index = getattr(frame, "index", ())
+    for label in labels:
+        if label not in index:
+            continue
+        try:
+            raw = frame.loc[label, column]
+        except Exception:
+            continue
+        # Duplicate row labels come back as a Series. Use the first number.
+        if hasattr(raw, "iloc"):
+            candidates = []
+            try:
+                candidates = [raw.iloc[i] for i in range(len(raw))]
+            except Exception:
+                candidates = []
+        else:
+            candidates = [raw]
+        for item in candidates:
+            value = safe_float(item)
+            if value is not None:
+                return value
+    return None
+
+
+def _dividends_paid(frame, column):
+    value = _statement_value(frame, _DIVIDEND_PAID_LABELS, column)
+    if value is None:
+        return None
+    return abs(value)
+
+
+def _free_cash_flow(frame, column):
+    direct = _statement_value(frame, _FCF_LABELS, column)
+    if direct is not None:
+        return direct
+    operating = _statement_value(frame, _OPERATING_CASH_LABELS, column)
+    capex = _statement_value(frame, _CAPEX_LABELS, column)
+    if operating is None or capex is None:
+        return None
+    # Capex is usually a negative outflow. A positive figure is still a cost.
+    return operating - abs(capex)
+
+
+def _ffo_like(frame, column):
+    """Simple REIT funds from operations: net income plus depreciation.
+
+    Gains on property sales are not adjusted. On the cash-flow statement
+    those lines do not have a reliable sign, and a wrong sign would create
+    a false warning. When either input is missing the result is None.
+    """
+    net = _statement_value(frame, _NET_INCOME_LABELS, column)
+    depreciation = _statement_value(frame, _DEPRECIATION_LABELS, column)
+    if net is None or depreciation is None:
+        return None
+    return net + abs(depreciation)
+
+
+def cash_payout_ratio(dividends_paid, cash_generated):
+    """Return (percent or None, deficit).
+
+    deficit is True when dividends were paid and the cash figure is not
+    positive. Missing inputs are (None, False) and never raise.
+    """
+    dividends = safe_float(dividends_paid)
+    cash = safe_float(cash_generated)
+    if dividends is None or cash is None:
+        return None, False
+    dividends = abs(dividends)
+    if dividends == 0:
+        return 0.0, False
+    if cash <= 0:
+        return None, True
+    return round((dividends / cash) * 100, 2), False
+
+
+def cash_flow_payout(frame, basis):
+    """Payout from the latest annual column that has both pieces.
+
+    `basis` is "fcf" or "ffo". A negative cash figure is kept: it is a
+    deficit, not a reason to fall back to an older healthy year.
+    """
+    result = {"fcfPayout": None, "fcfPayoutBasis": basis, "fcfDeficit": False}
+    if basis not in ("fcf", "ffo"):
+        result["fcfPayoutBasis"] = None
+        return result
+    if frame is None or getattr(frame, "empty", True):
+        return result
+    measure = _free_cash_flow if basis == "fcf" else _ffo_like
+    for column in _statement_columns(frame):
+        dividends = _dividends_paid(frame, column)
+        if dividends is None:
+            continue
+        cash = measure(frame, column)
+        if cash is None:
+            continue
+        payout, deficit = cash_payout_ratio(dividends, cash)
+        result["fcfPayout"] = payout
+        result["fcfDeficit"] = deficit
+        return result
+    return result
+
+
+def _as_of_date(as_of):
+    if as_of is None:
+        return datetime.date.today()
+    if isinstance(as_of, datetime.datetime):
+        return as_of.date()
+    if isinstance(as_of, datetime.date):
+        return as_of
+    return datetime.datetime.strptime(str(as_of)[:10], "%Y-%m-%d").date()
+
+
+# Gap (days) that best matches each payment frequency. Used to tell a
+# monthly payer from a quarterly one, and to spot an extra payment that
+# sits between two regular dates.
+_FREQUENCY_PERIODS = ((12, 30), (4, 91), (2, 182), (1, 365))
+
+
+def _infer_frequency(gaps):
+    """How many regular payments a year, from the gaps between them.
+
+    A special dividend splits one normal gap into two short ones. Those
+    short gaps must not make a monthly payer look weekly or a quarterly
+    payer look monthly. The closest normal step wins.
+    """
+    usable = [gap for gap in gaps if gap is not None and gap >= 0]
+    if not usable:
+        return 1
+    median_gap = statistics.median(usable)
+    best_freq = 1
+    best_key = (-1.0, -10**9)
+    for freq, period in _FREQUENCY_PERIODS:
+        score = 0.0
+        for gap in usable:
+            if abs(gap - period) <= period * 0.40:
+                score += 2
+            elif period >= 60 and abs(gap - period / 2.0) <= period * 0.30:
+                score += 1
+        key = (score, -abs(period - median_gap))
+        if key > best_key:
+            best_key = key
+            best_freq = freq
+    return best_freq
+
+
+def _period_days(frequency):
+    for freq, period in _FREQUENCY_PERIODS:
+        if freq == frequency:
+            return period
+    return 365
+
+
+def _without_dust(payments):
+    """Drop token amounts that are tiny beside the regular dividend.
+
+    A 0.01 adjustment next to a 2.00 dividend must not become the
+    year-end rate. With fewer than three payments the list is left
+    alone, so one regular payment and one much larger one can still
+    be told apart later.
+    """
+    if len(payments) < 3:
+        return payments
+    ordered = sorted(amount for _, amount in payments)
+    upper = ordered[len(ordered) // 2:]
+    scale = statistics.median(upper)
+    if scale <= 0:
+        return payments
+    kept = [item for item in payments if item[1] >= 0.15 * scale]
+    return kept if len(kept) >= 2 else payments
+
+
+def _split_regular_payments(payments):
+    """Return (regular payments, typical gap in days).
+
+    An extra payment crammed against the regular date is a special,
+    whether it is larger (a supplemental) or smaller (a stub). A repeated
+    higher amount is a new regular dividend, not a special. A one-off
+    payment at least twice the recent regular amount is a special when
+    the next payment goes back to the old amount. Amounts are already
+    split-adjusted.
+    """
+    payments = sorted(_without_dust(list(payments)), key=lambda item: item[0])
+    if len(payments) < 2:
+        return payments, 365
+    gaps = [(payments[i][0] - payments[i - 1][0]).days for i in range(1, len(payments))]
+    period = _period_days(_infer_frequency(gaps))
+    short = 0.70 * period
+    clusters = []
+    cluster = [0]
+    for index in range(1, len(payments)):
+        gap = (payments[index][0] - payments[index - 1][0]).days
+        if 0 <= gap < short:
+            cluster.append(index)
+        else:
+            if len(cluster) > 1:
+                clusters.append(cluster)
+            cluster = [index]
+    if len(cluster) > 1:
+        clusters.append(cluster)
+
+    in_cluster = {index for group in clusters for index in group}
+    special = set()
+    for group in clusters:
+        before = [payments[index][1] for index in range(group[0]) if index not in special]
+        # The recent regular amount, not the median of the whole history.
+        # A dividend that has been raised for years would otherwise look
+        # nothing like its old payments, and the supplemental would win.
+        before = before[-6:]
+        if not before:
+            before = [payments[index][1] for index in range(len(payments)) if index not in in_cluster]
+            before = before[:6]
+        baseline = statistics.median(before) if before else statistics.median(payments[index][1] for index in group)
+        matched = []
+        for index in group:
+            amount = payments[index][1]
+            # 15% either way is still the regular dividend (a raise or a
+            # small cut that happened to fall near another payment). A
+            # supplemental like 0.30 beside a 0.25 monthly is outside this.
+            if baseline > 0 and 0.85 * baseline <= amount <= 1.15 * baseline:
+                matched.append(index)
+        if matched:
+            for index in group:
+                if index not in matched:
+                    special.add(index)
+            continue
+        # Nothing in the cluster looks like the regular dividend. Keep the
+        # closest amount and treat the rest as specials.
+        keeper = min(group, key=lambda index: abs(payments[index][1] - baseline))
+        for index in group:
+            if index != keeper:
+                special.add(index)
+    regular = [payments[index] for index in range(len(payments)) if index not in special]
+    return _drop_reverting_spikes(regular), period
+
+
+def _drop_reverting_spikes(regular):
+    """Drop a single payment that is at least twice the recent rate and then reverts.
+
+    The next payment has to come back, so a dividend that really doubles
+    and stays there is a raise. The last payment in the history has no
+    successor, so it is kept.
+    """
+    if len(regular) < 3:
+        return regular
+    drop = set()
+    for index in range(len(regular)):
+        amount = regular[index][1]
+        previous = [regular[other][1] for other in range(max(0, index - 4), index) if other not in drop]
+        if not previous:
+            continue
+        baseline = statistics.median(previous)
+        if baseline <= 0 or amount < SPECIAL_DIVIDEND_MULTIPLE * baseline:
+            continue
+        nxt = None
+        for other in range(index + 1, len(regular)):
+            if other not in drop:
+                nxt = regular[other][1]
+                break
+        if nxt is None:
+            continue
+        if nxt < SPECIAL_DIVIDEND_MULTIPLE * baseline and nxt <= baseline * 1.5:
+            drop.add(index)
+    return [item for index, item in enumerate(regular) if index not in drop]
+
+
+def _local_frequency(regular, cutoff):
+    """Payment frequency from the gaps just before `cutoff`."""
+    dates = [ex_date for ex_date, _ in regular if ex_date <= cutoff]
+    if len(dates) < 2:
+        return 1
+    gaps = [(dates[index] - dates[index - 1]).days for index in range(1, len(dates))]
+    return _infer_frequency(gaps[-4:])
+
+
+def _rate_at_year_end(regular, year):
+    """Annualized regular dividend as of the end of `year`.
+
+    One full cycle of regular payments on or before 31 Dec: the last 12
+    for a monthly payer, the last 4 for a quarterly payer, and so on.
+    When every payment in that cycle is the same amount, this is the
+    year-end rate times the frequency. A December payment that is dated
+    in January still sits in the cycle of the following year, and the
+    year it left keeps a full cycle by reaching back one payment. It is
+    not an 11-payment year and a 13-payment year.
+    """
+    cutoff = datetime.date(year, 12, 31)
+    prior = [(ex_date, amount) for ex_date, amount in regular if ex_date <= cutoff]
+    if not prior:
+        return None
+    frequency = _local_frequency(regular, cutoff)
+    tail = prior[-frequency:]
+    if len(tail) < frequency:
+        return prior[-1][1] * frequency
+    return sum(amount for _, amount in tail)
+
+
+def _years_touched(payments, as_of, period_days):
+    """Calendar years through the last complete year that count as paid.
+
+    A payment dated in the year counts. So does a year the ex-date merely
+    stepped across, when the gap from the previous payment to the next one
+    is still a normal interval (an annual dividend moving from late
+    December to early January). A gap of more than one and a half
+    intervals is a year that was actually skipped.
+    """
+    latest = as_of.year - 1
+    dated = sorted((ex_date, amount) for ex_date, amount in payments if amount > 0 and ex_date <= as_of)
+    years = {ex_date.year for ex_date, _ in dated if ex_date.year <= latest}
+    limit = max(period_days, 1) * 1.5
+    for index in range(1, len(dated)):
+        gap = (dated[index][0] - dated[index - 1][0]).days
+        if gap > limit:
+            continue
+        year = dated[index - 1][0].year + 1
+        while year < dated[index][0].year and year <= latest:
+            years.add(year)
+            year += 1
+    return years
+
+
+def _rates_by_year(divs, as_of):
+    """Map each complete year that has a regular payment to its year-end rate."""
+    as_of = _as_of_date(as_of)
+    payments = [item for item in _dividend_payments(divs) if item[0] <= as_of]
+    regular, _period = _split_regular_payments(payments)
+    latest = as_of.year - 1
+    rates = {}
+    years = {ex_date.year for ex_date, _ in regular if ex_date.year <= latest}
+    for year in years:
+        rate = _rate_at_year_end(regular, year)
+        if rate is not None and rate > 0:
+            rates[year] = rate
+    return rates
+
+
+def _annual_dividends(divs, as_of):
+    """Per complete year: cash paid (specials included) and the regular rate.
+
+    `regular` is the year-end annualized rate, not the sum of the payments
+    whose ex-dates happened to fall in that calendar year.
+    """
+    as_of = _as_of_date(as_of)
+    payments = [item for item in _dividend_payments(divs) if item[0] <= as_of and item[0].year < as_of.year]
+    paid = {}
+    for ex_date, amount in payments:
+        paid[ex_date.year] = paid.get(ex_date.year, 0.0) + amount
+    rates = _rates_by_year(divs, as_of)
+    annual = {}
+    for year in set(paid) | set(rates):
+        annual[year] = {
+            "paid": paid.get(year, 0.0),
+            "regular": rates.get(year, 0.0),
+        }
+    return annual
+
+
+def _dividend_direction(current, previous):
+    current = safe_float(current)
+    previous = safe_float(previous)
+    if current is None or previous is None or previous <= 0:
+        return "unknown"
+    ratio = current / previous
+    if ratio > 1 + DIVIDEND_FLAT_BAND:
+        return "raised"
+    if ratio < 1 - DIVIDEND_FLAT_BAND:
+        return "cut"
+    return "flat"
+
+
+def _unknown_dividend_history():
+    return {
+        "yearsDividendPaid": None,
+        "yearsDividendRaised": None,
+        "dividendCagr5y": None,
+        "dividendCutRecent": False,
+    }
+
+
+def dividend_history_metrics(divs, as_of=None):
+    """Consecutive years paid, consecutive years raised, and 5-year CAGR.
+
+    Counts end at the last complete calendar year. `divs` of None means
+    the history could not be read: every figure is n/a and nothing warns.
+    An empty history is a real zero. Raises, cuts and the CAGR use the
+    regular dividend at each year end (one full payment cycle), not the
+    sum of the ex-dates that fell in the calendar year. A cut is a drop
+    of more than 1% in one of the last five complete years, or a stop:
+    the dividend was paid and then the latest complete years are empty.
+    A hole with payments on both sides is not a cut, and years before
+    the history starts are not cuts either.
+    """
+    if divs is None:
+        return _unknown_dividend_history()
+    try:
+        as_of = _as_of_date(as_of)
+        payments = [item for item in _dividend_payments(divs) if item[0] <= as_of]
+        _regular, period = _split_regular_payments(payments)
+        paid_set = _years_touched(payments, as_of, period)
+        rates = _rates_by_year(divs, as_of)
+    except Exception:
+        return _unknown_dividend_history()
+
+    latest = as_of.year - 1
+    paid_years = 0
+    year = latest
+    while paid_years < 120 and year in paid_set:
+        paid_years += 1
+        year -= 1
+
+    raised_years = 0
+    year = latest
+    while raised_years < 120:
+        if year not in rates or (year - 1) not in rates:
+            break
+        if _dividend_direction(rates[year], rates[year - 1]) != "raised":
+            break
+        raised_years += 1
+        year -= 1
+
+    cut = False
+    oldest = min(paid_set) if paid_set else None
+    for offset in range(RECENT_DIVIDEND_CUT_YEARS):
+        year = latest - offset
+        if oldest is None or year < oldest:
+            continue
+        if year in rates and (year - 1) in rates:
+            if _dividend_direction(rates[year], rates[year - 1]) == "cut":
+                cut = True
+                break
+            continue
+        # An empty year with payments on both sides can be a hole in the
+        # history, so it is not a cut. A stop is an empty year at the end,
+        # after a year that was paid.
+        if year not in paid_set and (year - 1) in paid_set:
+            later_paid = False
+            for earlier in range(offset):
+                if (latest - earlier) in paid_set:
+                    later_paid = True
+                    break
+            if not later_paid:
+                cut = True
+                break
+
+    cagr = None
+    end = rates.get(latest)
+    start = rates.get(latest - DIVIDEND_CAGR_YEARS)
+    if end and start and start > 0 and end > 0:
+        growth = (end / start) ** (1.0 / DIVIDEND_CAGR_YEARS) - 1.0
+        cagr = round(growth * 100, 2)
+
+    return {
+        "yearsDividendPaid": paid_years,
+        "yearsDividendRaised": raised_years,
+        "dividendCagr5y": cagr,
+        "dividendCutRecent": cut,
+    }
+
+
+def assemble_sustainability(sector, industry, divs, cashflow):
+    """History metrics plus the sector-aware cash payout. Never raises."""
+    block = empty_sustainability()
+    try:
+        block.update(dividend_history_metrics(divs))
+    except Exception:
+        pass
+    try:
+        basis = cash_payout_basis(sector, industry)
+    except Exception:
+        basis = "fcf"
+    block["fcfPayoutBasis"] = basis
+    if basis == "skipped":
+        block["fcfPayout"] = None
+        block["fcfDeficit"] = False
+        return block
+    try:
+        parsed = cash_flow_payout(cashflow, basis)
+    except Exception:
+        return block
+    block["fcfPayout"] = parsed.get("fcfPayout")
+    block["fcfDeficit"] = parsed.get("fcfDeficit") is True
+    if parsed.get("fcfPayoutBasis"):
+        block["fcfPayoutBasis"] = parsed["fcfPayoutBasis"]
+    return block
 
 
 def yields_differ_materially(forward_yield, trailing_yield) -> bool:

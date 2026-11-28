@@ -37,6 +37,47 @@ function finiteNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Above 100% the dividend is larger than the cash figure. Exactly 100%
+// is still covered and does not warn.
+const FCF_PAYOUT_WARNING_PERCENT = 100;
+
+function isOperatingInsurer(industry) {
+  const ind = String(industry || '').toLowerCase();
+  return ind.includes('insurance') && !ind.includes('broker');
+}
+
+// "ffo" for REITs, "skipped" for banks and insurers, "fcf" otherwise.
+// Insurance brokers keep free cash flow. The bank profile matches
+// sectorProfile, including savings, mortgage and credit.
+function cashPayoutBasis(sector, industry) {
+  const profile = sectorProfile(sector, industry);
+  if (profile === 'bank') return 'skipped';
+  if (profile === 'reit') return 'ffo';
+  if (isOperatingInsurer(industry)) return 'skipped';
+  return 'fcf';
+}
+
+// The warning the recommendation is allowed to act on. Missing figures
+// are not a warning. A dividend cut counts for every sector; the cash
+// payout does not count for banks and insurers.
+function sustainabilityFacts(input) {
+  const src = input || {};
+  const basis = cashPayoutBasis(src.sector, src.industry);
+  const payout = finiteNumber(src.fcfPayout);
+  const cut = src.dividendCutRecent === true || src.dividendCut === true;
+  const fcfApplies = basis !== 'skipped';
+  const fcfDeficit = fcfApplies && src.fcfDeficit === true;
+  const fcfHigh = fcfApplies && !fcfDeficit && payout != null && payout > FCF_PAYOUT_WARNING_PERCENT;
+  return {
+    basis,
+    warning: cut || fcfDeficit || fcfHigh,
+    fcfDeficit,
+    fcfHigh,
+    dividendCut: cut,
+    fcfPayout: payout,
+  };
+}
+
 // Same rounding as the cards: yield toFixed(2), P/E toFixed(1).
 function displayedNumber(value, digits) {
   const n = finiteNumber(value);
@@ -112,6 +153,10 @@ function scoreMetrics(input) {
   else if (perScore === 'expensive' || yieldScore === 'low') overallRecommendation = 'avoid_overvalued';
   else overallRecommendation = 'neutral';
 
+  // Only a Strong Buy steps down, and only to Buy. Any other label stays.
+  const facts = sustainabilityFacts(src);
+  if (overallRecommendation === 'strong_buy' && facts.warning) overallRecommendation = 'buy';
+
   return {
     perScore,
     yieldScore,
@@ -119,6 +164,7 @@ function scoreMetrics(input) {
     bookScore,
     payoutScore,
     overallRecommendation,
+    sustainabilityWarning: facts.warning,
     sectorProfile: profile,
   };
 }
@@ -135,11 +181,20 @@ function recommendationForItem(item, minYield, maxPer) {
     debtToEbitda: item.debtToEbitda,
     priceToBook: item.priceToBook,
     payoutRatio: item.payoutRatio,
+    fcfPayout: item.fcfPayout,
+    fcfDeficit: item.fcfDeficit,
+    dividendCutRecent: item.dividendCutRecent,
     minYield,
     maxPer,
   }).overallRecommendation;
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { sectorProfile, scoreMetrics, recommendationForItem };
+  module.exports = {
+    sectorProfile,
+    cashPayoutBasis,
+    sustainabilityFacts,
+    scoreMetrics,
+    recommendationForItem,
+  };
 }
