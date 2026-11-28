@@ -20,14 +20,14 @@ let currentView          = 'analyze';
 // ===== Config =====
 
 const METRICS = [
-  { key: 'per',           label: 'P/E Ratio',    scoreKey: 'perScore',    fmt: v => v.toFixed(1) + 'x',  tooltip: 'The Price-to-Earnings ratio tells you how many years of current profits you\'re paying for the stock. A PER below 15 is generally considered cheap. Above 20 may mean the stock is expensive — unless the company is growing fast.' },
+  { key: 'per',           label: 'P/E Ratio',    scoreKey: 'perScore',    fmt: v => v.toFixed(1) + 'x',  tooltip: 'The Price-to-Earnings ratio tells you how many years of current profits you\'re paying for the stock. A PER of 15 or below is generally considered cheap. Above 20 may mean the stock is expensive — unless the company is growing fast.' },
   { key: 'dividendYield', label: 'Div. Yield',    scoreKey: 'yieldScore',  fmt: v => v.toFixed(2) + '%', hasTrend: true, tooltip: 'Dividend yield shows how much the company pays you annually as a percentage of the current price. A yield between 3% and 6% is the sweet spot for dividend investors. Higher isn\'t always better — a very high yield can signal the dividend is at risk. The historical comparison shows whether the current yield is high or low relative to the past 3 years — a yield above its historical average may indicate the stock is cheaper than usual.' },
   { key: 'priceToBook',   label: 'Price / Book',  scoreKey: 'bookScore',   fmt: v => v.toFixed(2) + 'x', tooltip: 'Compares the stock price to the company\'s net asset value. Below 1 means you\'re buying the company for less than its assets are worth — potentially a bargain. Most useful for banks, utilities and companies with lots of physical assets.' },
   { key: 'debtToEbitda',  label: 'Debt / EBITDA', scoreKey: 'debtScore',   fmt: v => v.toFixed(2) + 'x', tooltip: 'Measures how many years of operating profit it would take to pay off all debt. Below 3 is healthy. Above 4 starts to be a concern. Very stable companies like utilities can handle higher levels.' },
   { key: 'payoutRatio',   label: 'Payout Ratio',  scoreKey: 'payoutScore', fmt: v => v.toFixed(1) + '%', tooltip: 'The percentage of earnings paid out as dividends. Between 40–60% is ideal — enough reward for shareholders while keeping money to grow. Above 80% may be unsustainable long-term.' },
 ];
 
-const YIELD_FORWARD_TOOLTIP = 'The latest dividend, annualised, divided by the current price. It shows what the company would pay you if it keeps the current dividend.';
+const YIELD_FORWARD_TOOLTIP = 'The latest dividend, annualised, divided by the current price. It shows what the company would pay you if it keeps the current dividend. A forward yield at or above your minimum counts as a high yield.';
 const YIELD_TRAILING_TOOLTIP = 'The sum of dividends paid over the last 12 months, divided by the current price. This is the figure brokers such as Revolut usually show.';
 
 const SCORE_CFG = {
@@ -166,14 +166,31 @@ function getCurrencySymbol() {
 }
 
 function getWithholdingTax() {
-  return parseFloat(localStorage.getItem('dlWithholdingTax') || '19');
+  return readWithholdingTax(localStorage);
+}
+
+function refreshWithholdingViews() {
+  _renderDividendsFromCache();
+  if (currentView === 'dividends') _renderDividendsTabContent();
 }
 
 function onWithholdingTaxInput(val) {
-  const v = Math.max(0, Math.min(50, parseInt(val, 10) || 0));
-  localStorage.setItem('dlWithholdingTax', String(v));
-  _renderDividendsFromCache();
-  if (currentView === 'dividends') _renderDividendsTabContent();
+  const trimmed = String(val ?? '').trim();
+  // Let the user clear the box before typing the next rate. Blur commits it.
+  if (trimmed === '') return;
+  const v = writeWithholdingTax(trimmed, localStorage);
+  const taxInput = document.getElementById('withholding-tax-input');
+  if (taxInput && taxInput.value !== String(v)) taxInput.value = String(v);
+  refreshWithholdingViews();
+}
+
+function commitWithholdingTax() {
+  const taxInput = document.getElementById('withholding-tax-input');
+  if (!taxInput) return;
+  const trimmed = String(taxInput.value ?? '').trim();
+  const v = trimmed === '' ? readWithholdingTax(localStorage) : writeWithholdingTax(trimmed, localStorage);
+  taxInput.value = String(v);
+  refreshWithholdingViews();
 }
 
 function initSettings() {
@@ -184,7 +201,11 @@ function initSettings() {
   updateCurrencyBtns(currency);
 
   const taxInput = document.getElementById('withholding-tax-input');
-  if (taxInput) taxInput.value = getWithholdingTax();
+  if (taxInput) {
+    taxInput.min = String(WITHHOLDING_TAX_MIN);
+    taxInput.max = String(WITHHOLDING_TAX_MAX);
+    taxInput.value = String(getWithholdingTax());
+  }
 
   const minYield = getMinYield();
   const maxPer = getMaxPer();
@@ -316,12 +337,17 @@ function updateNavSearch() {
 
 // ===== App state (Analyze sub-states) =====
 
+function setSearchText(value) {
+  const text = value == null ? '' : String(value);
+  const homeInput = document.getElementById('search-input');
+  const navInput = document.getElementById('nav-search-input');
+  if (homeInput) homeInput.value = text;
+  if (navInput) navInput.value = text;
+}
+
 function enterResultsState() {
   document.body.classList.add('has-results');
   switchView('analyze');
-  const navInput  = document.getElementById('nav-search-input');
-  const homeInput = document.getElementById('search-input');
-  if (navInput && homeInput) navInput.value = homeInput.value;
   updateNavSearch();
 }
 
@@ -892,7 +918,13 @@ function debounce(fn, ms) {
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
-async function searchStocks(q) {
+let homeSearchToken = 0;
+let navSearchToken = 0;
+
+async function searchStocks(q, token) {
+  if (token !== homeSearchToken) return;
+  const input = document.getElementById('search-input');
+  if (!input || input.value.trim() !== String(q).trim()) return;
   if (!q.trim()) { hideSugg(); return; }
   try {
     const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
@@ -924,7 +956,10 @@ function selectSugg(symbol) {
 }
 
 // Nav search
-async function searchNavStocks(q) {
+async function searchNavStocks(q, token) {
+  if (token !== navSearchToken) return;
+  const input = document.getElementById('nav-search-input');
+  if (!input || input.value.trim() !== String(q).trim()) return;
   if (!q.trim()) { hideNavSugg(); return; }
   try {
     const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
@@ -994,8 +1029,18 @@ function selectModalSugg(symbol, name, sector, industry) {
 // ===== Analysis =====
 
 async function analyzeStock(ticker) {
-  currentTicker = ticker.toUpperCase();
+  const symbol = String(ticker || '').trim();
+  if (!symbol) return;
+  const requested = symbol.toUpperCase();
+  currentTicker = requested;
   currentAnalysis = null;
+  // Both boxes show the ticker being opened. Copying the home field here
+  // used to put the previous search back into the top box.
+  setSearchText(requested);
+  homeSearchToken++;
+  navSearchToken++;
+  hideSugg();
+  hideNavSugg();
   enterResultsState();
   showLoading();
   try {
@@ -1003,13 +1048,16 @@ async function analyzeStock(ticker) {
       min_yield: String(getMinYield()),
       max_per: String(getMaxPer()),
     });
-    const res = await fetch(`/api/analyze/${encodeURIComponent(ticker)}?${params}`);
+    const res = await fetch(`/api/analyze/${encodeURIComponent(symbol)}?${params}`);
+    if (currentTicker !== requested) return;
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      showError(err.detail || `Could not load data for "${ticker}".`);
+      showError(err.detail || `Could not load data for "${symbol}".`);
       return;
     }
     const data = await res.json();
+    if (currentTicker !== requested) return;
+    if (data.ticker) setSearchText(data.ticker);
     currentAnalysis      = data;
     currentName          = data.companyName;
     currentSector        = data.sector;
@@ -1022,6 +1070,7 @@ async function analyzeStock(ticker) {
     renderResults(data);
     fetchAndRenderHistoricalYield(currentTicker);
   } catch {
+    if (currentTicker !== requested) return;
     showError('Network error — please check your connection and try again.');
   }
 }
@@ -2436,12 +2485,18 @@ const debouncedSearch      = debounce(searchStocks,      400);
 const debouncedNavSearch   = debounce(searchNavStocks,   400);
 const debouncedModalSearch = debounce(searchModalStocks, 400);
 
-document.getElementById('search-input').addEventListener('input', e => debouncedSearch(e.target.value));
+document.getElementById('search-input').addEventListener('input', e => {
+  const token = ++homeSearchToken;
+  debouncedSearch(e.target.value, token);
+});
 document.getElementById('search-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') { const v = e.target.value.trim(); if (v) { hideSugg(); analyzeStock(v); } }
 });
 
-document.getElementById('nav-search-input').addEventListener('input', e => debouncedNavSearch(e.target.value));
+document.getElementById('nav-search-input').addEventListener('input', e => {
+  const token = ++navSearchToken;
+  debouncedNavSearch(e.target.value, token);
+});
 document.getElementById('nav-search-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') { const v = e.target.value.trim(); if (v) { hideNavSugg(); analyzeStock(v); } }
 });

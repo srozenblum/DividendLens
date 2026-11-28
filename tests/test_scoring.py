@@ -83,16 +83,51 @@ CASES = [
         "perScore": "neutral",
         "yieldScore": "neutral",
     }, minYield=6, maxPer=12),
-    _case("yield exactly at the minimum is not a buy", {
+    _case("yield exactly at the minimum is a buy", {
+        "overallRecommendation": "strong_buy",
+        "perScore": "buy",
+        "yieldScore": "buy",
+    }, dividendYield=4.0, minYield=4),
+    _case("yield just below the displayed minimum is not a buy", {
         "overallRecommendation": "buy",
         "perScore": "buy",
         "yieldScore": "neutral",
-    }, dividendYield=4.0, minYield=4),
-    _case("P/E exactly at the maximum is not a buy", {
+    }, dividendYield=3.994, minYield=4),
+    _case("yield that displays as the minimum is a buy", {
+        "overallRecommendation": "strong_buy",
+        "perScore": "buy",
+        "yieldScore": "buy",
+    }, dividendYield=3.9999, minYield=4),
+    _case("yield exactly at a 5% minimum is a buy", {
+        "overallRecommendation": "strong_buy",
+        "perScore": "buy",
+        "yieldScore": "buy",
+    }, dividendYield=5, minYield=5),
+    _case("P/E exactly at the maximum is a buy", {
+        "overallRecommendation": "strong_buy",
+        "perScore": "buy",
+        "yieldScore": "buy",
+    }, per=15, maxPer=15),
+    _case("P/E just above the displayed maximum is not a buy", {
         "overallRecommendation": "buy",
         "perScore": "neutral",
         "yieldScore": "buy",
-    }, per=15, maxPer=15),
+    }, per=15.06, maxPer=15),
+    _case("P/E that displays as the maximum is a buy", {
+        "overallRecommendation": "strong_buy",
+        "perScore": "buy",
+        "yieldScore": "buy",
+    }, per=15.04, maxPer=15),
+    _case("P/E just under 15 that displays as 15.0 is a buy", {
+        "overallRecommendation": "strong_buy",
+        "perScore": "buy",
+        "yieldScore": "buy",
+    }, per=14.96, maxPer=15),
+    _case("P/E exactly at a 12x cap is a buy", {
+        "overallRecommendation": "strong_buy",
+        "perScore": "buy",
+        "yieldScore": "buy",
+    }, per=12, maxPer=12),
     _case("cheap stock with a low yield is still buy", {
         "overallRecommendation": "buy",
         "perScore": "buy",
@@ -373,6 +408,46 @@ def test_python_and_javascript_agree():
     assert js_payload["fallbacks"][2] == "buy"
 
 
+def test_score_stock_includes_displayed_thresholds():
+    """score_stock uses the same inclusive, display-precision comparison."""
+    at_cap = {
+        "sector": "Communication Services",
+        "industry": "Telecom Services",
+        "trailingPE": 15.04,
+        "dividendRate": 4.0,
+        "currentPrice": 100.0,
+        "payoutRatio": 0.5,
+        "priceToBook": 1.5,
+    }
+    scores = main.score_stock(at_cap, debt_to_ebitda=2.0, min_yield=4, max_per=15)
+    assert main.dividend_yield_percent(at_cap) == 4.0
+    assert scores["perScore"] == "buy"
+    assert scores["yieldScore"] == "buy"
+    assert scores["overallRecommendation"] == "strong_buy"
+
+    just_over = dict(at_cap)
+    just_over["trailingPE"] = 15.06
+    just_over["dividendRate"] = 3.99
+    over = main.score_stock(just_over, debt_to_ebitda=2.0, min_yield=4, max_per=15)
+    assert over["perScore"] == "neutral"
+    assert over["yieldScore"] == "neutral"
+    assert over["overallRecommendation"] == "neutral"
+
+    # Raw yield 3.9999 is stored as 4.00% before scoring, and that meets 4%.
+    fuzzy = {
+        "sector": "Communication Services",
+        "industry": "Telecom Services",
+        "trailingPE": 14.96,
+        "dividendYield": 3.9999,
+        "payoutRatio": 0.5,
+        "priceToBook": 1.5,
+    }
+    fuzzy_scores = main.score_stock(fuzzy, debt_to_ebitda=2.0, min_yield=4, max_per=15)
+    assert main.dividend_yield_percent(fuzzy) == 4.0
+    assert fuzzy_scores["perScore"] == "buy"
+    assert fuzzy_scores["yieldScore"] == "buy"
+
+
 def test_axa_info_dict_is_not_a_holding():
     """CS.PA comes back from Yahoo as industry 'Insurance - Diversified'.
 
@@ -480,6 +555,7 @@ def _print_table():
 
 if __name__ == "__main__":
     test_python_and_javascript_agree()
+    test_score_stock_includes_displayed_thresholds()
     test_axa_info_dict_is_not_a_holding()
     test_threshold_query_names()
     _print_table()
