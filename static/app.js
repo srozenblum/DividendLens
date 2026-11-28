@@ -756,6 +756,59 @@ function renderRefreshStatus(failed) {
   el.textContent = `${failed.length} ${noun} failed to refresh (${failed.join(', ')}) — previous data kept.`;
 }
 
+function applyWatchlistRefresh(symbol, data) {
+  const watchlist = getWatchlist();
+  const wanted = String(symbol || '').toUpperCase();
+  const index = watchlist.findIndex(w =>
+    w.symbol === symbol || String(w.symbol).toUpperCase() === wanted
+  );
+  if (index === -1) return false;
+  const inputs = scoreInputsFromAnalysis(data);
+  if (!inputs) return false;
+  const live = liveScores(data);
+  const item = watchlist[index];
+  Object.assign(item, {
+    name: data.companyName || item.name,
+    sector: data.sector || item.sector || '',
+    industry: data.industry || item.industry || '',
+    recommendation: live.overallRecommendation,
+    divYield: inputs.divYield,
+    trailingDivYield: inputs.trailingDivYield,
+    yieldComparison: inputs.yieldComparison,
+    per: inputs.per,
+    dividendTrend: data.dividendTrend,
+    debtToEbitda: inputs.debtToEbitda,
+    priceToBook: inputs.priceToBook,
+    payoutRatio: inputs.payoutRatio,
+    hasScoreInputs: true,
+  });
+  saveWatchlist(watchlist);
+  // One row at a time, on the main thread, so two results cannot overwrite
+  // each other. Leave an open note alone.
+  if (currentView === 'watchlist' && !document.querySelector('.note-textarea')) {
+    renderWatchlistTable();
+  }
+  return true;
+}
+
+async function readNdjson(body, onRow) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (line.trim()) onRow(JSON.parse(line));
+    }
+  }
+  buf += decoder.decode();
+  if (buf.trim()) onRow(JSON.parse(buf));
+}
+
 async function refreshWatchlist() {
   const btn = document.getElementById('wl-refresh-btn');
   if (btn) btn.disabled = true;
@@ -769,73 +822,66 @@ async function refreshWatchlist() {
 
   let completed = 0;
   const total = wl.length;
+  const failed = [];
+  const pending = new Set(wl.map(i => i.symbol));
   const updateBtn = () => {
     if (btn) btn.textContent = `↻ Refreshing... (${completed}/${total})`;
   };
   updateBtn();
 
-  // Collect every result, then write the watchlist once. Writing each row
-  // as it returned raced with the others and could drop a successful update.
-  const updates = new Map();
-  const failed = [];
-
-  const refreshOne = async (item) => {
-    try {
-      const params = new URLSearchParams({
-        min_yield: String(getMinYield()),
-        max_per: String(getMaxPer()),
-      });
-      const res = await fetch(`/api/analyze/${encodeURIComponent(item.symbol)}?${params}`);
-      if (!res.ok) throw new Error('bad response');
-      const data = await res.json();
-      const inputs = scoreInputsFromAnalysis(data);
-      if (!inputs) throw new Error('bad payload');
-      const live = liveScores(data);
-      updates.set(item.symbol, {
-        name: data.companyName || item.name,
-        sector: data.sector || item.sector || '',
-        industry: data.industry || item.industry || '',
-        recommendation: live.overallRecommendation,
-        divYield: inputs.divYield,
-        trailingDivYield: inputs.trailingDivYield,
-        yieldComparison: inputs.yieldComparison,
-        per: inputs.per,
-        dividendTrend: data.dividendTrend,
-        debtToEbitda: inputs.debtToEbitda,
-        priceToBook: inputs.priceToBook,
-        payoutRatio: inputs.payoutRatio,
-        hasScoreInputs: true,
-      });
-    } catch (_) {
-      failed.push(item.symbol);
-    } finally {
-      completed++;
-      updateBtn();
+  const finishOne = (symbol, ok) => {
+    let key = symbol;
+    if (!pending.has(key)) {
+      const wanted = String(symbol || '').toUpperCase();
+      key = [...pending].find(s => String(s).toUpperCase() === wanted);
     }
+    if (!key || !pending.has(key)) return;
+    pending.delete(key);
+    if (!ok) failed.push(key);
+    completed++;
+    updateBtn();
   };
 
   try {
-    await asyncPool(10, wl, refreshOne);
-    if (updates.size) {
-      const watchlist = getWatchlist();
-      for (const item of watchlist) {
-        const upd = updates.get(item.symbol);
-        if (!upd) continue;
-        Object.assign(item, upd);
+    const res = await fetch('/api/watchlist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        symbols: wl.map(i => i.symbol),
+        min_yield: getMinYield(),
+        max_per: getMaxPer(),
+      }),
+    });
+    if (!res.ok || !res.body) throw new Error('bad response');
+    await readNdjson(res.body, (item) => {
+      const symbol = item && item.symbol;
+      if (item && item.ok && applyWatchlistRefresh(symbol, item.data)) {
+        finishOne(symbol, true);
+      } else {
+        finishOne(symbol, false);
       }
-      saveWatchlist(watchlist);
-      renderWatchlistTable();
-      const d = new Date();
-      const now = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
-        + ', ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
-      saveWlTimestamp(now);
-      renderWlTimestamp();
-    }
-    const failedOrdered = wl.filter(item => failed.includes(item.symbol)).map(item => item.symbol);
-    renderRefreshStatus(failedOrdered);
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '↻ Refresh'; }
+    });
+  } catch (_) {
+    // rows already written stay; the rest keep their previous values
   }
+
+  for (const symbol of [...pending]) {
+    pending.delete(symbol);
+    failed.push(symbol);
+    completed++;
+  }
+  updateBtn();
+
+  if (failed.length < total) {
+    const d = new Date();
+    const now = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+      + ', ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    saveWlTimestamp(now);
+    renderWlTimestamp();
+  }
+  const failedOrdered = wl.filter(item => failed.includes(item.symbol)).map(item => item.symbol);
+  renderRefreshStatus(failedOrdered);
+  if (btn) { btn.disabled = false; btn.textContent = '↻ Refresh'; }
 }
 
 

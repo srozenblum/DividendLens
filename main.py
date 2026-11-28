@@ -1,6 +1,9 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from typing import Optional
+import asyncio
 import yfinance as yf
 import math
 import datetime
@@ -8,7 +11,20 @@ import json
 import re
 import statistics
 
+from yahoo_cache import (
+    YAHOO_CONCURRENCY,
+    cached_dividend_date,
+    cached_dividends,
+    cached_info,
+    cached_price_history,
+    cached_statements,
+    call_yahoo,
+)
+
 app = FastAPI()
+
+# One request can refresh a whole watchlist. Above this, callers should page.
+MAX_WATCHLIST_BATCH = 200
 
 
 def safe_float(value):
@@ -339,19 +355,52 @@ async def search_tickers(q: str):
         return []
 
 
-@app.get("/api/analyze/{ticker}")
-async def analyze_ticker(
-    ticker: str,
-    min_yield: Optional[float] = None,
-    max_per: Optional[float] = None,
-    minYield: Optional[float] = None,
-    maxPer: Optional[float] = None,
-):
-    min_yield, max_per = resolve_score_thresholds(min_yield, max_per, minYield, maxPer)
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+class _DividendSeries:
+    """Small stand-in so dividend_growth_trend can read a series it did not fetch."""
 
+    def __init__(self, dividends):
+        self.dividends = dividends
+
+
+def _debt_to_ebitda(info, symbol, fresh):
+    """Same Debt/EBITDA rule as before: info first, statements only if that is missing."""
+    total_debt = safe_float(info.get("totalDebt"))
+    ebitda = safe_float(info.get("ebitda"))
+    if total_debt is not None and ebitda and ebitda > 0:
+        return total_debt / ebitda
+    try:
+        bs, fin = cached_statements(symbol, fresh=fresh)
+        if bs is not None and not getattr(bs, "empty", True):
+            for label in ["Total Debt", "Long Term Debt"]:
+                if label in bs.index:
+                    value = safe_float(bs.loc[label].iloc[0])
+                    if value is not None:
+                        total_debt = value
+                        break
+        if fin is not None and not getattr(fin, "empty", True):
+            for label in ["EBITDA", "Ebitda"]:
+                if label in fin.index:
+                    value = safe_float(fin.loc[label].iloc[0])
+                    if value is not None:
+                        ebitda = value
+                        break
+        if total_debt is not None and ebitda and ebitda > 0:
+            return total_debt / ebitda
+    except Exception:
+        return None
+    return None
+
+
+def _build_analysis(ticker: str, min_yield: float, max_per: float, fresh: bool = False, include_history: bool = True):
+    """Shared scoring path for /api/analyze and the watchlist.
+
+    The watchlist skips the price chart and the dividend calendar. Everything
+    that feeds the recommendation, the two yields, and the dividend trend is
+    the same data and the same functions either way.
+    """
+    try:
+        symbol = str(ticker or "").strip()
+        info = cached_info(symbol, fresh=fresh)
         if not info or not info.get("quoteType"):
             raise HTTPException(status_code=404, detail=f"Ticker '{ticker}' not found.")
 
@@ -359,69 +408,31 @@ async def analyze_ticker(
         if price is None:
             raise HTTPException(status_code=404, detail=f"No price data available for '{ticker}'.")
 
-        # Debt/EBITDA — try info dict first, fall back to financial statements
-        debt_to_ebitda = None
-        total_debt = safe_float(info.get("totalDebt"))
-        ebitda = safe_float(info.get("ebitda"))
-        if total_debt is not None and ebitda and ebitda > 0:
-            debt_to_ebitda = total_debt / ebitda
-        else:
-            try:
-                bs = stock.balance_sheet
-                fin = stock.financials
-                if bs is not None and not bs.empty:
-                    for label in ["Total Debt", "Long Term Debt"]:
-                        if label in bs.index:
-                            v = safe_float(bs.loc[label].iloc[0])
-                            if v is not None:
-                                total_debt = v
-                                break
-                if fin is not None and not fin.empty:
-                    for label in ["EBITDA", "Ebitda"]:
-                        if label in fin.index:
-                            v = safe_float(fin.loc[label].iloc[0])
-                            if v is not None:
-                                ebitda = v
-                                break
-                if total_debt is not None and ebitda and ebitda > 0:
-                    debt_to_ebitda = total_debt / ebitda
-            except Exception:
-                pass
-
+        debt_to_ebitda = _debt_to_ebitda(info, symbol, fresh)
         dividend_yield = dividend_yield_percent(info)
         pays_dividends = dividend_yield is not None and dividend_yield > 0
 
         last_dividend_date = None
-        try:
-            cal = stock.calendar
-            if isinstance(cal, dict):
-                v = cal.get("Dividend Date")
-                if v is not None:
-                    last_dividend_date = str(v)
-            elif hasattr(cal, "index") and "Dividend Date" in cal.index:
-                last_dividend_date = str(cal.loc["Dividend Date"].iloc[0])
-        except Exception:
-            pass
-
         price_history = []
-        try:
-            hist = stock.history(period="1y", interval="1wk")
-            if hist is not None and not hist.empty:
-                for ts, row in hist.iterrows():
-                    price_history.append({
-                        "date": ts.strftime("%Y-%m-%d"),
-                        "close": round(float(row["Close"]), 2),
-                    })
-        except Exception:
-            pass
+        if include_history:
+            try:
+                last_dividend_date = cached_dividend_date(symbol, fresh=fresh)
+            except Exception:
+                last_dividend_date = None
+            try:
+                price_history = cached_price_history(symbol, fresh=fresh)
+            except Exception:
+                price_history = []
 
         per_raw = resolved_per(info)
         payout = safe_float(info.get("payoutRatio"))
         ptb = safe_float(info.get("priceToBook"))
         payout_percent = None if payout is None else payout * 100
+        sector = info.get("sector") or ""
+        industry = info.get("industry") or ""
         scores = score_metrics(
-            sector=info.get("sector") or "",
-            industry=info.get("industry") or "",
+            sector=sector,
+            industry=industry,
             per=per_raw,
             dividend_yield=dividend_yield,
             debt_to_ebitda=debt_to_ebitda,
@@ -430,19 +441,19 @@ async def analyze_ticker(
             min_yield=min_yield,
             max_per=max_per,
         )
-        dividend_trend = dividend_growth_trend(stock)
         try:
-            yield_summary = summarize_dividend_yields(
-                stock.dividends,
-                price,
-                dividend_yield,
-            )
+            divs = cached_dividends(symbol, fresh=fresh)
+        except Exception:
+            divs = None
+        dividend_trend = dividend_growth_trend(_DividendSeries(divs))
+        try:
+            yield_summary = summarize_dividend_yields(divs, price, dividend_yield)
         except Exception:
             yield_summary = empty_yield_summary()
 
-        return {
-            "companyName": info.get("longName") or info.get("shortName") or ticker.upper(),
-            "ticker": ticker.upper(),
+        full = {
+            "companyName": info.get("longName") or info.get("shortName") or symbol.upper(),
+            "ticker": symbol.upper(),
             "currentPrice": price,
             "currency": info.get("currency", "USD"),
             "exchange": info.get("exchange", ""),
@@ -477,38 +488,18 @@ async def analyze_ticker(
             "scores": scores,
             "dividendTrend": dividend_trend,
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/historical-price")
-async def historical_price(symbol: str, date: str):
-    try:
-        stock = yf.Ticker(symbol)
-        dt = datetime.datetime.strptime(date, "%Y-%m-%d")
-        end = dt + datetime.timedelta(days=4)
-        hist = stock.history(
-            start=dt.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval="1d",
-        )
-        if hist is not None and not hist.empty:
-            price = round(float(hist["Close"].iloc[0]), 4)
-            actual_date = hist.index[0].strftime("%Y-%m-%d")
-        else:
-            info = stock.info
-            price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
-            actual_date = date
-            if price is None:
-                raise HTTPException(status_code=404, detail=f"No price data for '{symbol}'")
-        info = stock.info
+        if include_history:
+            return full
+        # Every field the watchlist stores and re-scores from when the sliders move.
         return {
-            "symbol": symbol.upper(),
-            "date": actual_date,
-            "price": price,
-            "currency": info.get("currency", "USD"),
+            "companyName": full["companyName"],
+            "ticker": full["ticker"],
+            "sector": full["sector"],
+            "industry": full["industry"],
+            "metrics": full["metrics"],
+            "scoringInputs": full["scoringInputs"],
+            "scores": full["scores"],
+            "dividendTrend": full["dividendTrend"],
         }
     except HTTPException:
         raise
@@ -516,32 +507,191 @@ async def historical_price(symbol: str, date: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/historical-yield")
-async def historical_yield_endpoint(symbol: str):
+def _watchlist_row(ticker: str, min_yield: float, max_per: float, fresh: bool = False):
+    return _build_analysis(ticker, min_yield, max_per, fresh, include_history=False)
+
+
+@app.get("/api/analyze/{ticker}")
+async def analyze_ticker(
+    ticker: str,
+    min_yield: Optional[float] = None,
+    max_per: Optional[float] = None,
+    minYield: Optional[float] = None,
+    maxPer: Optional[float] = None,
+    fresh: bool = False,
+):
+    min_yield, max_per = resolve_score_thresholds(min_yield, max_per, minYield, maxPer)
     try:
-        stock = yf.Ticker(symbol)
-        info  = stock.info
+        return await asyncio.to_thread(_build_analysis, ticker, min_yield, max_per, fresh, True)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        dividend_rate_hy = safe_float(info.get("dividendRate")) or safe_float(info.get("lastDividendValue"))
-        current_price_hy = safe_float(info.get("currentPrice")) or safe_float(info.get("regularMarketPrice"))
-        if dividend_rate_hy and current_price_hy and current_price_hy > 0:
-            current_yield = round((dividend_rate_hy / current_price_hy) * 100, 2)
-        else:
-            current_yield_raw = safe_float(info.get("dividendYield", None))
-            if current_yield_raw is None or current_yield_raw <= 0:
-                current_yield = None
-            elif current_yield_raw < 0.50:
-                current_yield = round(current_yield_raw * 100, 2)
-            elif current_yield_raw > 30:
-                current_yield = None
-            else:
-                current_yield = round(current_yield_raw, 2)
 
-        hist = stock.history(period="3y", interval="1mo")
+@app.get("/api/watchlist/{ticker}")
+async def watchlist_ticker(
+    ticker: str,
+    min_yield: Optional[float] = None,
+    max_per: Optional[float] = None,
+    minYield: Optional[float] = None,
+    maxPer: Optional[float] = None,
+    fresh: bool = False,
+):
+    """One watchlist row: the inputs the live recommendation uses, both yields, trend, name and sector."""
+    min_yield, max_per = resolve_score_thresholds(min_yield, max_per, minYield, maxPer)
+    try:
+        return await asyncio.to_thread(_watchlist_row, ticker, min_yield, max_per, fresh)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class WatchlistBatch(BaseModel):
+    symbols: list[str] = Field(default_factory=list)
+    min_yield: Optional[float] = None
+    max_per: Optional[float] = None
+    minYield: Optional[float] = None
+    maxPer: Optional[float] = None
+    fresh: bool = False
+
+
+def _unique_symbols(symbols) -> list:
+    ordered = []
+    seen = set()
+    for raw in symbols or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        key = text.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(text)
+        if len(ordered) >= MAX_WATCHLIST_BATCH:
+            break
+    return ordered
+
+
+def _error_text(exc) -> str:
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, str) and detail:
+        return detail
+    return str(exc)
+
+
+async def iter_watchlist_rows(symbols, min_yield: float = 4.0, max_per: float = 15.0, fresh: bool = False):
+    """Yield watchlist rows as each ticker finishes. Order is completion order."""
+    cleaned = _unique_symbols(symbols)
+    if not cleaned:
+        return
+    slot = asyncio.Semaphore(YAHOO_CONCURRENCY)
+    queue = asyncio.Queue()
+
+    async def worker(symbol):
+        async with slot:
+            try:
+                data = await asyncio.to_thread(_watchlist_row, symbol, min_yield, max_per, fresh)
+                await queue.put({"symbol": symbol, "ok": True, "data": data})
+            except HTTPException as exc:
+                await queue.put({"symbol": symbol, "ok": False, "error": _error_text(exc)})
+            except Exception as exc:
+                await queue.put({"symbol": symbol, "ok": False, "error": str(exc)})
+
+    async def produce():
+        try:
+            await asyncio.gather(*(worker(symbol) for symbol in cleaned))
+        finally:
+            await queue.put(None)
+
+    producer = asyncio.create_task(produce())
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        producer.cancel()
+        try:
+            await producer
+        except asyncio.CancelledError:
+            pass
+
+
+@app.post("/api/watchlist")
+async def watchlist_batch(body: WatchlistBatch):
+    """Refresh many tickers. Each line of the body is one JSON result, as it finishes."""
+
+    min_yield, max_per = resolve_score_thresholds(
+        body.min_yield, body.max_per, body.minYield, body.maxPer,
+    )
+
+    async def ndjson():
+        async for item in iter_watchlist_rows(body.symbols, min_yield, max_per, body.fresh):
+            yield json.dumps(item, separators=(",", ":")) + "\n"
+
+    return StreamingResponse(
+        ndjson(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _historical_price_sync(symbol: str, date: str):
+    dt = datetime.datetime.strptime(date, "%Y-%m-%d")
+    end = dt + datetime.timedelta(days=4)
+
+    def load_history():
+        return yf.Ticker(symbol).history(
+            start=dt.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            interval="1d",
+        )
+
+    hist = call_yahoo(load_history)
+    if hist is not None and not hist.empty:
+        price = round(float(hist["Close"].iloc[0]), 4)
+        actual_date = hist.index[0].strftime("%Y-%m-%d")
+    else:
+        info = cached_info(symbol)
+        price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+        actual_date = date
+        if price is None:
+            raise HTTPException(status_code=404, detail=f"No price data for '{symbol}'")
+    info = cached_info(symbol)
+    return {
+        "symbol": symbol.upper(),
+        "date": actual_date,
+        "price": price,
+        "currency": info.get("currency", "USD"),
+    }
+
+
+@app.get("/api/historical-price")
+async def historical_price(symbol: str, date: str):
+    try:
+        return await asyncio.to_thread(_historical_price_sync, symbol, date)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _historical_yield_sync(symbol: str):
+    try:
+        info = cached_info(symbol)
+        current_yield = dividend_yield_percent(info)
+
+        def load_history():
+            return yf.Ticker(symbol).history(period="3y", interval="1mo")
+
+        hist = call_yahoo(load_history)
         if hist is None or hist.empty:
             return {"symbol": symbol.upper(), "avgYield3y": None, "currentYield": current_yield, "context": "unavailable"}
 
-        divs = stock.dividends
+        divs = cached_dividends(symbol)
         current_year = datetime.datetime.now().year
         yearly_yields = []
 
@@ -582,6 +732,11 @@ async def historical_yield_endpoint(symbol: str):
         }
     except Exception:
         return {"symbol": symbol.upper(), "avgYield3y": None, "currentYield": None, "context": "unavailable"}
+
+
+@app.get("/api/historical-yield")
+async def historical_yield_endpoint(symbol: str):
+    return await asyncio.to_thread(_historical_yield_sync, symbol)
 
 
 # Share-count dust below this is treated as zero (float noise, not a real lot).
@@ -862,10 +1017,14 @@ async def dividends_received_endpoint(
         if not normalized:
             return {"symbol": symbol.upper(), "dividends": [], "totalReceived": 0.0, "currency": "USD"}
 
-        stock = yf.Ticker(symbol)
-        info = stock.info or {}
+        def load_inputs():
+            info = cached_info(symbol) or {}
+            divs = cached_dividends(symbol)
+            return info, divs
+
+        info, divs = await asyncio.to_thread(load_inputs)
         currency = info.get("currency", "USD") if isinstance(info, dict) else "USD"
-        result_divs = calculate_dividends_received(stock.dividends, normalized)
+        result_divs = calculate_dividends_received(divs, normalized)
         total_received = round(sum(d["totalAmount"] for d in result_divs), 2)
         return {
             "symbol": symbol.upper(),
