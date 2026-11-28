@@ -216,12 +216,140 @@ def test_flat_band_splits_and_suspension():
     assert dust_metrics["yearsDividendRaised"] == 1
     assert dust_metrics["dividendCutRecent"] is False
 
-    # A repeated large amount is kept. It is not one special.
-    repeated = main._regular_dividend_total([0.50, 0.50, 2.00, 2.00])
-    assert repeated == 5.0
+    # A repeated large amount is a new regular dividend, not one special.
+    # The following year stays at 2.00, so neither large payment reverts.
+    repeated = []
+    repeated.extend([
+        (datetime.date(2024, 3, 15), 0.50),
+        (datetime.date(2024, 6, 15), 0.50),
+        (datetime.date(2024, 9, 15), 2.00),
+        (datetime.date(2024, 12, 15), 2.00),
+    ])
+    repeated.extend(_quarters(2025, 2.00))
+    repeated_rates = main._rates_by_year(_series(repeated), AS_OF)
+    assert repeated_rates[2024] == 5.0
 
-    # Gradual raises inside the year stay in the total.
-    assert main._regular_dividend_total([0.40, 0.42, 0.44, 0.46]) == 1.72
+    # A step-up inside the year stays in the cycle. Nothing here is a special.
+    gradual = _series([
+        (datetime.date(2025, 3, 15), 0.40),
+        (datetime.date(2025, 6, 15), 0.42),
+        (datetime.date(2025, 9, 15), 0.44),
+        (datetime.date(2025, 12, 15), 0.46),
+    ])
+    assert main._rates_by_year(gradual, AS_OF)[2025] == 1.72
+
+
+def test_calendar_count_shift_is_not_a_cut():
+    """11 payments one year and 13 the next is a slipped ex-date, not a cut.
+
+    The December payment is dated 2 January. Summing the calendar year
+    would show a drop of about one month and then a jump. The year-end
+    cycle still has 12 regular payments, and the raise streak continues.
+    The same shift for a quarterly payer (3 payments, then 5) is covered
+    too.
+    """
+    payments = []
+    for year in range(2018, 2026):
+        amount = round(0.20 + 0.01 * (year - 2018), 2)
+        months = range(1, 12) if year == 2024 else range(1, 13)
+        for month in months:
+            payments.append((datetime.date(year, month, 15), amount))
+    payments.append((datetime.date(2025, 1, 2), 0.26))
+    metrics = main.dividend_history_metrics(_series(payments), as_of=AS_OF)
+    rates = main._rates_by_year(_series(payments), AS_OF)
+    assert metrics["dividendCutRecent"] is False
+    assert metrics["yearsDividendRaised"] == 7
+    # 11 × 0.26 would be 2.86. A full cycle is about 12 × 0.26.
+    assert rates[2024] > 3.0
+    assert rates[2025] > rates[2024]
+    assert abs(rates[2025] - 0.27 * 12) < 0.05
+
+    quarterly = []
+    for year in range(2018, 2026):
+        amount = round(0.40 + 0.02 * (year - 2018), 2)
+        months = (3, 6, 9) if year == 2024 else (3, 6, 9, 12)
+        for month in months:
+            quarterly.append((datetime.date(year, month, 15), amount))
+    quarterly.append((datetime.date(2025, 1, 2), 0.52))
+    q_metrics = main.dividend_history_metrics(_series(quarterly), as_of=AS_OF)
+    q_rates = main._rates_by_year(_series(quarterly), AS_OF)
+    assert q_metrics["dividendCutRecent"] is False
+    assert q_metrics["yearsDividendRaised"] == 7
+    # 3 × 0.52 would be 1.56. A full quarterly cycle is about 4 × 0.52.
+    assert q_rates[2024] > 1.9
+    assert q_rates[2025] > q_rates[2024]
+
+
+def test_shapes_from_real_dividend_patterns():
+    """Synthetic series shaped like names the screen has to get right.
+
+    No market data is stored. The shapes are: a quarterly cut that sticks
+    (the 2022 AT&T cut), a monthly dividend plus a smaller or larger
+    supplemental (Main Street), an annual payer that raises most years
+    (a European annual dividend), and a semiannual interim plus a larger
+    final whose final payment slips into January.
+    """
+    quarterly = []
+    for year in range(2019, 2026):
+        amount = 0.52 if year < 2022 else 0.278
+        months = (3, 6, 9, 12)
+        for index, month in enumerate(months):
+            if year == 2022 and index < 2:
+                paid = 0.52
+            else:
+                paid = amount
+            quarterly.append((datetime.date(year, month, 15), paid))
+    cut = main.dividend_history_metrics(_series(quarterly), as_of=AS_OF)
+    assert cut["dividendCutRecent"] is True
+    assert cut["yearsDividendRaised"] == 0
+
+    monthly = []
+    for year in range(2018, 2026):
+        regular = round(0.20 + 0.005 * (year - 2018), 3)
+        for month in range(1, 13):
+            monthly.append((datetime.date(year, month, 5), regular))
+        extra = 0.08 if year < 2022 else round(regular + 0.05, 3)
+        for month in (3, 6, 9, 12):
+            monthly.append((datetime.date(year, month, 20), extra))
+    supplemental = main.dividend_history_metrics(_series(monthly), as_of=AS_OF)
+    assert supplemental["dividendCutRecent"] is False
+    assert supplemental["yearsDividendRaised"] >= 5
+    rates = main._rates_by_year(_series(monthly), AS_OF)
+    # The year-end cycle is the monthly amount, not the monthly amount plus supplements.
+    assert abs(rates[2025] - round(0.20 + 0.005 * 7, 3) * 12) < 0.15
+
+    annual = []
+    annual_amounts = {
+        2018: 8.0, 2019: 9.0, 2020: 9.6, 2021: 9.6,
+        2022: 10.8, 2023: 11.4, 2024: 13.8, 2025: 15.4,
+    }
+    for year, amount in annual_amounts.items():
+        annual.append((datetime.date(year, 5, 9), amount))
+    europe = main.dividend_history_metrics(_series(annual), as_of=AS_OF)
+    assert europe["dividendCutRecent"] is False
+    assert europe["yearsDividendPaid"] == 8
+    assert europe["yearsDividendRaised"] == 4
+    assert europe["dividendCagr5y"] is not None and europe["dividendCagr5y"] > 0
+
+    # Interim in May, larger final in November. The 2024 final is dated
+    # 3 January 2025, which used to look like a missing payment and a cut.
+    semi = []
+    for year, interim, final in (
+        (2021, 0.70, 1.10),
+        (2022, 0.75, 1.15),
+        (2023, 0.80, 1.20),
+        (2024, 0.85, None),
+        (2025, 0.90, 1.35),
+    ):
+        semi.append((datetime.date(year, 5, 15), interim))
+        if final is not None and year != 2024:
+            semi.append((datetime.date(year, 11, 15), final))
+    semi.append((datetime.date(2025, 1, 3), 1.25))
+    slipped = main.dividend_history_metrics(_series(semi), as_of=AS_OF)
+    slipped_rates = main._rates_by_year(_series(semi), AS_OF)
+    assert slipped["dividendCutRecent"] is False
+    assert slipped_rates[2024] > slipped_rates[2023]
+    assert slipped_rates[2025] > slipped_rates[2024]
 
 
 def test_gaps_cagr_and_missing_history():
@@ -512,6 +640,8 @@ if __name__ == "__main__":
     test_reit_uses_ffo_and_ignores_negative_free_cash_flow()
     test_dividend_streaks_ignore_the_current_year_and_specials()
     test_flat_band_splits_and_suspension()
+    test_calendar_count_shift_is_not_a_cut()
+    test_shapes_from_real_dividend_patterns()
     test_gaps_cagr_and_missing_history()
     test_sector_basis_and_assemble_never_penalizes_a_gap()
     test_basis_matches_javascript()

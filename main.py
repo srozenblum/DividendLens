@@ -353,19 +353,22 @@ def score_stock(
 
 def dividend_growth_trend(stock) -> str:
     try:
-        divs = stock.dividends
-        if divs is None or len(divs) == 0:
+        divs = getattr(stock, "dividends", None)
+        if divs is None:
+            return "insufficient_data"
+        try:
+            if len(divs) == 0:
+                return "insufficient_data"
+        except TypeError:
             return "insufficient_data"
 
-        current_year = datetime.datetime.now().year
-        # Group by year using lambda to avoid timezone issues; exclude current partial year
-        annual = divs.groupby(lambda ts: ts.year).sum()
-        annual = annual[(annual.index >= current_year - 5) & (annual.index < current_year)]
-
-        if len(annual) < 2:
+        as_of = datetime.date.today()
+        rates = _rates_by_year(divs, as_of)
+        latest = as_of.year - 1
+        values = [rates[year] for year in range(latest - 4, latest + 1) if year in rates]
+        if len(values) < 2:
             return "insufficient_data"
-
-        values = annual.tail(3).tolist()
+        values = values[-3:]
 
         if all(values[i] < values[i + 1] for i in range(len(values) - 1)):
             return "growing"
@@ -1253,50 +1256,246 @@ def _as_of_date(as_of):
     return datetime.datetime.strptime(str(as_of)[:10], "%Y-%m-%d").date()
 
 
-def _regular_dividend_total(amounts):
-    """Annual regular dividend, with a one-off special payment removed.
+# Gap (days) that best matches each payment frequency. Used to tell a
+# monthly payer from a quarterly one, and to spot an extra payment that
+# sits between two regular dates.
+_FREQUENCY_PERIODS = ((12, 30), (4, 91), (2, 182), (1, 365))
 
-    One payment in the year is the dividend: an annual payer cannot be
-    split into regular and special. A repeated large amount is a higher
-    regular dividend, not a special. Detection matches
-    possible_special_dividend. A token payment beside one normal dividend
-    (a 0.01 adjustment next to 2.00) must not make the normal payment look
-    like the special, so the other payments have to be at least 5% of the
-    outlier before it is removed. Amounts are already split-adjusted, so
-    a share split is not adjusted again here.
+
+def _infer_frequency(gaps):
+    """How many regular payments a year, from the gaps between them.
+
+    A special dividend splits one normal gap into two short ones. Those
+    short gaps must not make a monthly payer look weekly or a quarterly
+    payer look monthly. The closest normal step wins.
     """
-    positive = []
-    for amount in amounts:
-        value = safe_float(amount)
-        if value is not None and value > 0:
-            positive.append(value)
-    if len(positive) <= 1:
-        return sum(positive)
-    fake_payments = [(datetime.date(2000, 1, 1), amount) for amount in positive]
-    if not possible_special_dividend(fake_payments):
-        return sum(positive)
-    largest = max(positive)
-    others = [amount for amount in positive if not _same_dividend_amount(amount, largest)]
-    if not others:
-        return sum(positive)
-    baseline = statistics.median(others)
-    if baseline <= 0 or baseline < 0.05 * largest:
-        return sum(positive)
-    return sum(others)
+    usable = [gap for gap in gaps if gap is not None and gap >= 0]
+    if not usable:
+        return 1
+    median_gap = statistics.median(usable)
+    best_freq = 1
+    best_key = (-1.0, -10**9)
+    for freq, period in _FREQUENCY_PERIODS:
+        score = 0.0
+        for gap in usable:
+            if abs(gap - period) <= period * 0.40:
+                score += 2
+            elif period >= 60 and abs(gap - period / 2.0) <= period * 0.30:
+                score += 1
+        key = (score, -abs(period - median_gap))
+        if key > best_key:
+            best_key = key
+            best_freq = freq
+    return best_freq
+
+
+def _period_days(frequency):
+    for freq, period in _FREQUENCY_PERIODS:
+        if freq == frequency:
+            return period
+    return 365
+
+
+def _without_dust(payments):
+    """Drop token amounts that are tiny beside the regular dividend.
+
+    A 0.01 adjustment next to a 2.00 dividend must not become the
+    year-end rate. With fewer than three payments the list is left
+    alone, so one regular payment and one much larger one can still
+    be told apart later.
+    """
+    if len(payments) < 3:
+        return payments
+    ordered = sorted(amount for _, amount in payments)
+    upper = ordered[len(ordered) // 2:]
+    scale = statistics.median(upper)
+    if scale <= 0:
+        return payments
+    kept = [item for item in payments if item[1] >= 0.15 * scale]
+    return kept if len(kept) >= 2 else payments
+
+
+def _split_regular_payments(payments):
+    """Return (regular payments, typical gap in days).
+
+    An extra payment crammed against the regular date is a special,
+    whether it is larger (a supplemental) or smaller (a stub). A repeated
+    higher amount is a new regular dividend, not a special. A one-off
+    payment at least twice the recent regular amount is a special when
+    the next payment goes back to the old amount. Amounts are already
+    split-adjusted.
+    """
+    payments = sorted(_without_dust(list(payments)), key=lambda item: item[0])
+    if len(payments) < 2:
+        return payments, 365
+    gaps = [(payments[i][0] - payments[i - 1][0]).days for i in range(1, len(payments))]
+    period = _period_days(_infer_frequency(gaps))
+    short = 0.70 * period
+    clusters = []
+    cluster = [0]
+    for index in range(1, len(payments)):
+        gap = (payments[index][0] - payments[index - 1][0]).days
+        if 0 <= gap < short:
+            cluster.append(index)
+        else:
+            if len(cluster) > 1:
+                clusters.append(cluster)
+            cluster = [index]
+    if len(cluster) > 1:
+        clusters.append(cluster)
+
+    in_cluster = {index for group in clusters for index in group}
+    special = set()
+    for group in clusters:
+        before = [payments[index][1] for index in range(group[0]) if index not in special]
+        # The recent regular amount, not the median of the whole history.
+        # A dividend that has been raised for years would otherwise look
+        # nothing like its old payments, and the supplemental would win.
+        before = before[-6:]
+        if not before:
+            before = [payments[index][1] for index in range(len(payments)) if index not in in_cluster]
+            before = before[:6]
+        baseline = statistics.median(before) if before else statistics.median(payments[index][1] for index in group)
+        matched = []
+        for index in group:
+            amount = payments[index][1]
+            # 15% either way is still the regular dividend (a raise or a
+            # small cut that happened to fall near another payment). A
+            # supplemental like 0.30 beside a 0.25 monthly is outside this.
+            if baseline > 0 and 0.85 * baseline <= amount <= 1.15 * baseline:
+                matched.append(index)
+        if matched:
+            for index in group:
+                if index not in matched:
+                    special.add(index)
+            continue
+        # Nothing in the cluster looks like the regular dividend. Keep the
+        # closest amount and treat the rest as specials.
+        keeper = min(group, key=lambda index: abs(payments[index][1] - baseline))
+        for index in group:
+            if index != keeper:
+                special.add(index)
+    regular = [payments[index] for index in range(len(payments)) if index not in special]
+    return _drop_reverting_spikes(regular), period
+
+
+def _drop_reverting_spikes(regular):
+    """Drop a single payment that is at least twice the recent rate and then reverts.
+
+    The next payment has to come back, so a dividend that really doubles
+    and stays there is a raise. The last payment in the history has no
+    successor, so it is kept.
+    """
+    if len(regular) < 3:
+        return regular
+    drop = set()
+    for index in range(len(regular)):
+        amount = regular[index][1]
+        previous = [regular[other][1] for other in range(max(0, index - 4), index) if other not in drop]
+        if not previous:
+            continue
+        baseline = statistics.median(previous)
+        if baseline <= 0 or amount < SPECIAL_DIVIDEND_MULTIPLE * baseline:
+            continue
+        nxt = None
+        for other in range(index + 1, len(regular)):
+            if other not in drop:
+                nxt = regular[other][1]
+                break
+        if nxt is None:
+            continue
+        if nxt < SPECIAL_DIVIDEND_MULTIPLE * baseline and nxt <= baseline * 1.5:
+            drop.add(index)
+    return [item for index, item in enumerate(regular) if index not in drop]
+
+
+def _local_frequency(regular, cutoff):
+    """Payment frequency from the gaps just before `cutoff`."""
+    dates = [ex_date for ex_date, _ in regular if ex_date <= cutoff]
+    if len(dates) < 2:
+        return 1
+    gaps = [(dates[index] - dates[index - 1]).days for index in range(1, len(dates))]
+    return _infer_frequency(gaps[-4:])
+
+
+def _rate_at_year_end(regular, year):
+    """Annualized regular dividend as of the end of `year`.
+
+    One full cycle of regular payments on or before 31 Dec: the last 12
+    for a monthly payer, the last 4 for a quarterly payer, and so on.
+    When every payment in that cycle is the same amount, this is the
+    year-end rate times the frequency. A December payment that is dated
+    in January still sits in the cycle of the following year, and the
+    year it left keeps a full cycle by reaching back one payment. It is
+    not an 11-payment year and a 13-payment year.
+    """
+    cutoff = datetime.date(year, 12, 31)
+    prior = [(ex_date, amount) for ex_date, amount in regular if ex_date <= cutoff]
+    if not prior:
+        return None
+    frequency = _local_frequency(regular, cutoff)
+    tail = prior[-frequency:]
+    if len(tail) < frequency:
+        return prior[-1][1] * frequency
+    return sum(amount for _, amount in tail)
+
+
+def _years_touched(payments, as_of, period_days):
+    """Calendar years through the last complete year that count as paid.
+
+    A payment dated in the year counts. So does a year the ex-date merely
+    stepped across, when the gap from the previous payment to the next one
+    is still a normal interval (an annual dividend moving from late
+    December to early January). A gap of more than one and a half
+    intervals is a year that was actually skipped.
+    """
+    latest = as_of.year - 1
+    dated = sorted((ex_date, amount) for ex_date, amount in payments if amount > 0 and ex_date <= as_of)
+    years = {ex_date.year for ex_date, _ in dated if ex_date.year <= latest}
+    limit = max(period_days, 1) * 1.5
+    for index in range(1, len(dated)):
+        gap = (dated[index][0] - dated[index - 1][0]).days
+        if gap > limit:
+            continue
+        year = dated[index - 1][0].year + 1
+        while year < dated[index][0].year and year <= latest:
+            years.add(year)
+            year += 1
+    return years
+
+
+def _rates_by_year(divs, as_of):
+    """Map each complete year that has a regular payment to its year-end rate."""
+    as_of = _as_of_date(as_of)
+    payments = [item for item in _dividend_payments(divs) if item[0] <= as_of]
+    regular, _period = _split_regular_payments(payments)
+    latest = as_of.year - 1
+    rates = {}
+    years = {ex_date.year for ex_date, _ in regular if ex_date.year <= latest}
+    for year in years:
+        rate = _rate_at_year_end(regular, year)
+        if rate is not None and rate > 0:
+            rates[year] = rate
+    return rates
 
 
 def _annual_dividends(divs, as_of):
-    """Complete calendar years only. The current year is still in progress."""
-    grouped = {}
-    for ex_date, amount in _dividend_payments(divs):
-        if ex_date.year >= as_of.year:
-            continue
-        grouped.setdefault(ex_date.year, []).append(amount)
+    """Per complete year: cash paid (specials included) and the regular rate.
+
+    `regular` is the year-end annualized rate, not the sum of the payments
+    whose ex-dates happened to fall in that calendar year.
+    """
+    as_of = _as_of_date(as_of)
+    payments = [item for item in _dividend_payments(divs) if item[0] <= as_of and item[0].year < as_of.year]
+    paid = {}
+    for ex_date, amount in payments:
+        paid[ex_date.year] = paid.get(ex_date.year, 0.0) + amount
+    rates = _rates_by_year(divs, as_of)
     annual = {}
-    for year, amounts in grouped.items():
+    for year in set(paid) | set(rates):
         annual[year] = {
-            "paid": sum(amounts),
-            "regular": _regular_dividend_total(amounts),
+            "paid": paid.get(year, 0.0),
+            "regular": rates.get(year, 0.0),
         }
     return annual
 
@@ -1328,7 +1527,9 @@ def dividend_history_metrics(divs, as_of=None):
 
     Counts end at the last complete calendar year. `divs` of None means
     the history could not be read: every figure is n/a and nothing warns.
-    An empty history is a real zero. A cut is a regular-dividend decline
+    An empty history is a real zero. Raises, cuts and the CAGR use the
+    regular dividend at each year end (one full payment cycle), not the
+    sum of the ex-dates that fell in the calendar year. A cut is a drop
     of more than 1% in one of the last five complete years, or a stop:
     the dividend was paid and then the latest complete years are empty.
     A hole with payments on both sides is not a cut, and years before
@@ -1338,55 +1539,48 @@ def dividend_history_metrics(divs, as_of=None):
         return _unknown_dividend_history()
     try:
         as_of = _as_of_date(as_of)
-        annual = _annual_dividends(divs, as_of)
+        payments = [item for item in _dividend_payments(divs) if item[0] <= as_of]
+        _regular, period = _split_regular_payments(payments)
+        paid_set = _years_touched(payments, as_of, period)
+        rates = _rates_by_year(divs, as_of)
     except Exception:
         return _unknown_dividend_history()
 
     latest = as_of.year - 1
     paid_years = 0
     year = latest
-    while paid_years < 120:
-        info = annual.get(year)
-        if not info or info["paid"] <= 0:
-            break
+    while paid_years < 120 and year in paid_set:
         paid_years += 1
         year -= 1
 
     raised_years = 0
     year = latest
     while raised_years < 120:
-        current = annual.get(year)
-        previous = annual.get(year - 1)
-        if not current or not previous:
+        if year not in rates or (year - 1) not in rates:
             break
-        if _dividend_direction(current["regular"], previous["regular"]) != "raised":
+        if _dividend_direction(rates[year], rates[year - 1]) != "raised":
             break
         raised_years += 1
         year -= 1
 
     cut = False
-    oldest = min(annual) if annual else None
+    oldest = min(paid_set) if paid_set else None
     for offset in range(RECENT_DIVIDEND_CUT_YEARS):
         year = latest - offset
         if oldest is None or year < oldest:
             continue
-        current = annual.get(year)
-        previous = annual.get(year - 1)
-        current_paid = 0 if current is None else current["paid"]
-        previous_paid = 0 if previous is None else previous["paid"]
-        if current_paid > 0 and previous_paid > 0:
-            if _dividend_direction(current["regular"], previous["regular"]) == "cut":
+        if year in rates and (year - 1) in rates:
+            if _dividend_direction(rates[year], rates[year - 1]) == "cut":
                 cut = True
                 break
             continue
         # An empty year with payments on both sides can be a hole in the
         # history, so it is not a cut. A stop is an empty year at the end,
         # after a year that was paid.
-        if current_paid <= 0 and previous_paid > 0:
+        if year not in paid_set and (year - 1) in paid_set:
             later_paid = False
             for earlier in range(offset):
-                later = annual.get(latest - earlier)
-                if later and later["paid"] > 0:
+                if (latest - earlier) in paid_set:
                     later_paid = True
                     break
             if not later_paid:
@@ -1394,10 +1588,10 @@ def dividend_history_metrics(divs, as_of=None):
                 break
 
     cagr = None
-    end = annual.get(latest)
-    start = annual.get(latest - DIVIDEND_CAGR_YEARS)
-    if end and start and start["regular"] > 0 and end["regular"] > 0:
-        growth = (end["regular"] / start["regular"]) ** (1.0 / DIVIDEND_CAGR_YEARS) - 1.0
+    end = rates.get(latest)
+    start = rates.get(latest - DIVIDEND_CAGR_YEARS)
+    if end and start and start > 0 and end > 0:
+        growth = (end / start) ** (1.0 / DIVIDEND_CAGR_YEARS) - 1.0
         cagr = round(growth * 100, 2)
 
     return {
